@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Now Playing Hub</title>
+<style>
+:root{--bg:#0e0e14;--card:#171722;--line:#262636;--text:#f2f2f6;--dim:#8d8da0;--acc:#fa2d48;--ok:#35d07f;--bad:#ff5c5c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:18px 24px;border-bottom:1px solid var(--line)}
+header h1{font-size:18px;margin:0;flex:1}
+.pill{padding:4px 12px;border-radius:99px;font-size:12px;background:var(--line);color:var(--dim)}
+.pill.ok{background:rgba(53,208,127,.15);color:var(--ok)}.pill.bad{background:rgba(255,92,92,.15);color:var(--bad)}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;padding:20px 24px;max-width:1200px;margin:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.card h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:0 0 14px}
+.now{display:flex;gap:14px}
+.cover{width:120px;height:120px;border-radius:10px;background:#22222e;object-fit:cover;flex:none}
+.meta{min-width:0;flex:1}.t{font-size:17px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dim{color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar{height:6px;background:#2a2a3a;border-radius:3px;margin:14px 0 4px;overflow:hidden}.bar>i{display:block;height:100%;background:var(--acc);width:0}
+.times{display:flex;justify-content:space-between;color:var(--dim);font-size:12px}
+.ctrl{display:flex;gap:8px;margin-top:12px}
+button,.btn{background:#242434;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:8px 14px;font:inherit;cursor:pointer}
+button:hover{border-color:#3a3a52}button.p{background:var(--acc);border-color:var(--acc);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)}.row:first-of-type{border-top:0}
+.row .grow{flex:1;min-width:0}.sel{outline:2px solid var(--acc);border-radius:10px;padding:8px 10px;margin:2px 0}
+label{display:block;color:var(--dim);font-size:12px;margin:12px 0 4px}
+input[type=text],input[type=password]{width:100%;background:#10101a;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:8px 10px;font:inherit}
+input[type=range]{width:100%;accent-color:var(--acc)}
+input.num{width:100%;background:#10101a;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:8px 10px;font:inherit}
+.sw{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.sw b{width:26px;height:26px;border-radius:50%;cursor:pointer;border:2px solid transparent}
+.sw b:hover{border-color:#fff}input[type=color]{width:34px;height:30px;border:0;background:none;padding:0}
+.msg{font-size:12px;color:var(--dim);margin-top:8px;min-height:16px}
+.val{float:right;color:var(--text)}
+</style>
+</head>
+<body>
+<header><h1>Now Playing Hub</h1><span id="ver" class="pill"></span><span id="espPill" class="pill">ESP32 ...</span></header>
+<main>
+
+<section class="card"><h2>En lecture</h2>
+  <div id="nothing" class="dim">Rien en lecture (ou l'appli suivie est fermee).</div>
+  <div id="nowbox" class="now" hidden>
+    <img id="cover" class="cover" alt="">
+    <div class="meta"><div id="t" class="t"></div><div id="a" class="dim"></div><div id="al" class="dim"></div>
+      <div class="bar"><i id="bar"></i></div><div class="times"><span id="pos"></span><span id="dur"></span></div>
+    </div>
+  </div>
+  <div class="ctrl"><button onclick="cmd('prev')">&#9198; Precedent</button><button class="p" onclick="cmd('toggle')">&#9199; Lecture / Pause</button><button onclick="cmd('next')">Suivant &#9197;</button></div>
+</section>
+
+<section class="card"><h2>Application suivie</h2>
+  <div class="row"><div class="grow"><b>Automatique</b><div class="dim">Cider, Apple Music ou iTunes</div></div><button id="autoBtn" onclick="selectApp('')">Choisir</button></div>
+  <div id="sessions"></div>
+  <div class="msg">Choisis ici un autre lecteur (Spotify, navigateur...) si besoin. La liste montre ce que Windows detecte.</div>
+</section>
+
+<section class="card"><h2>Affichage de la carte</h2>
+  <label>Luminosite <span id="briV" class="val"></span></label><input id="bri" type="range" min="5" max="100">
+  <label>Vitesse du defilement du titre <span id="scrV" class="val"></span></label><input id="scr" type="range" min="10" max="150">
+  <label>Couleur d'accent</label>
+  <div class="sw"><input id="acc" type="color">
+    <b style="background:#fa2d48" data-c="#FA2D48"></b><b style="background:#ff9500" data-c="#FF9500"></b><b style="background:#30d158" data-c="#30D158"></b>
+    <b style="background:#0a84ff" data-c="#0A84FF"></b><b style="background:#bf5af2" data-c="#BF5AF2"></b><b style="background:#ffffff" data-c="#FFFFFF"></b></div>
+  <label><input id="showApp" type="checkbox"> Afficher le nom et le logo de l'appli en haut de l'ecran</label>
+  <label><input id="dynAcc" type="checkbox"> Couleur d'accent automatique (tirée de la pochette)</label>
+  <label><input id="lyrics" type="checkbox"> Paroles synchronisées (via lrclib.net : titre et artiste lui sont envoyés)</label>
+  <div id="cfgMsg" class="msg"></div>
+</section>
+
+<section class="card"><h2>Connexion</h2>
+  <label>Adresse de l'ESP32 (nowplaying.local ou IP)</label><input id="host" type="text">
+  <label>Jeton de mise a jour (OTA_TOKEN)</label><input id="token" type="password">
+  <label>Depot GitHub des mises a jour (utilisateur/depot)</label><input id="repo" type="text" placeholder="ex : arizaki/nowplaying-firmware">
+  <div class="ctrl"><button class="p" onclick="saveSettings()">Enregistrer</button></div>
+  <label><input id="auto" type="checkbox"> Lancer au demarrage de Windows</label>
+  <div class="ctrl"><button onclick="wifiReset()">Réinitialiser le Wi-Fi de la carte</button></div>
+  <div class="msg">La carte redémarre en mode configuration : connecte-toi au réseau « NowPlaying-Setup » et ouvre 192.168.4.1.</div>
+  <div id="setMsg" class="msg"></div>
+</section>
+
+<section class="card"><h2>Ecran de veille</h2>
+  <div id="weatherBox" style="display:flex;align-items:center;gap:14px;padding:10px 0 14px;border-bottom:1px solid var(--line);margin-bottom:8px">
+    <div style="font-size:36px" id="wIcon">⛅</div>
+    <div>
+      <div id="wTemp" style="font-size:22px;font-weight:600"></div>
+      <div id="wDesc" class="dim"></div>
+      <div id="wWind" class="dim" style="font-size:12px"></div>
+    </div>
+  </div>
+  <label>Rechercher une ville</label>
+  <div style="display:flex;gap:8px"><input id="cityQ" type="text" placeholder="ex : Lyon"><button onclick="geo()">Chercher</button></div>
+  <div id="cityRes"></div>
+  <label>Ville (nom affiché)</label><input id="locName" type="text" placeholder="ex : Bruxelles">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <div><label>Latitude</label><input id="lat" type="text" placeholder="50.85"></div>
+    <div><label>Longitude</label><input id="lon" type="text" placeholder="4.35"></div>
+  </div>
+  <label>Fuseau horaire</label>
+  <select id="tz" class="num">
+    <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe centrale (Paris, Bruxelles, Berlin…)</option>
+    <option value="GMT0BST,M3.5.0/1,M10.5.0">Europe de l'Ouest (Londres, Lisbonne)</option>
+    <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe de l'Est (Athènes, Helsinki)</option>
+    <option value="EST5EDT,M3.2.0,M11.1.0">Amérique – Est (New York, Montréal)</option>
+    <option value="CST6CDT,M3.2.0,M11.1.0">Amérique – Centre (Chicago)</option>
+    <option value="MST7MDT,M3.2.0,M11.1.0">Amérique – Montagnes (Denver)</option>
+    <option value="PST8PDT,M3.2.0,M11.1.0">Amérique – Pacifique (Los Angeles)</option>
+    <option value="JST-9">Japon</option>
+    <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Australie – Est (Sydney)</option>
+  </select>
+  <label>URL flux RSS actualités</label><input id="rssUrl" type="text" placeholder="https://exemple.com/rss.xml">
+  <label>Nombre d'actualités <span id="ncV" class="val"></span></label><input id="nc" type="range" min="1" max="10">
+  <div class="ctrl"><button class="p" onclick="saveIdle()">Enregistrer</button></div>
+  <div id="idleMsg" class="msg"></div>
+</section>
+
+<section class="card"><h2>Mode nuit et veille</h2>
+  <label><input id="nightOn" type="checkbox"> Activer le mode nuit (luminosité réduite)</label>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <div><label>Début (heure)</label><input id="nightStart" type="number" min="0" max="23" class="num"></div>
+    <div><label>Fin (heure)</label><input id="nightEnd" type="number" min="0" max="23" class="num"></div>
+  </div>
+  <label>Luminosité la nuit <span id="nightBriV" class="val"></span></label><input id="nightBri" type="range" min="1" max="100">
+  <label>Baisser la luminosité après (min sans toucher) <span id="dimV" class="val"></span></label><input id="dim" type="range" min="1" max="60">
+  <label>Luminosité après inactivité <span id="dimBriV" class="val"></span></label><input id="dimBri" type="range" min="1" max="100">
+  <div class="ctrl"><button class="p" onclick="saveIdle()">Enregistrer</button></div>
+  <div id="nightMsg" class="msg"></div>
+</section>
+
+<section class="card"><h2>Firmware de la carte</h2>
+  <div>Version installee : <b id="fw">?</b></div>
+  <div class="ctrl"><button onclick="checkGh()">Verifier sur GitHub</button><button id="ghBtn" class="p" hidden onclick="flashGh()">Installer</button></div>
+  <div id="ghMsg" class="msg"></div>
+  <label>Ou choisir un fichier firmware.bin</label>
+  <input id="file" type="file" accept=".bin">
+  <div class="ctrl"><button onclick="flashFile()">Envoyer a la carte</button></div>
+  <div class="bar"><i id="ubar"></i></div><div id="uMsg" class="msg"></div>
+</section>
+
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const fmt=s=>{s=Math.max(0,Math.floor(s||0));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')};
+async function api(path,body){const r=await fetch(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json().catch(()=>({}))}
+const cmd=c=>api('/api/cmd',{cmd:c});
+const selectApp=id=>api('/api/select-app',{id});
+let loaded=false,lastKey='',ghUrl='',timer=null;
+const friendly=id=>/^[0-9A-Fa-f]{16}$/.test(id)?'Media (navigateur ?)':id.split('!')[0].split('_')[0];
+
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+async function refresh(){
+  let s;try{s=await api('/api/state')}catch{return}
+  $('ver').textContent='Appli v'+s.appVersion;
+  const p=$('espPill');p.className='pill '+(s.esp.online?'ok':'bad');
+  p.textContent=s.esp.online?('ESP32 connecte'+(s.esp.version?' - fw '+s.esp.version:'')):'ESP32 injoignable ('+s.esp.host+')';
+  $('fw').textContent=s.esp.version||'?';
+  const n=s.now;$('nowbox').hidden=!n;$('nothing').hidden=!!n;
+  if(n){
+    $('t').textContent=n.title;$('a').textContent=n.artist||'-';$('al').textContent=(n.album||'')+(n.app?'  ·  '+n.app:'');
+    $('pos').textContent=fmt(n.position);$('dur').textContent=n.duration>0?fmt(n.duration):'--:--';
+    $('bar').style.width=n.duration>0?Math.min(100,n.position/n.duration*100)+'%':'0';
+    if(n.key!==lastKey){lastKey=n.key;$('cover').src='/cover.jpg?k='+encodeURIComponent(n.key)}
+  }
+  $('autoBtn').disabled=!s.selectedAppId;
+  $('sessions').innerHTML=s.sessions.map(x=>`<div class="row ${x.id===s.selectedAppId?'sel':''}"><div class="grow"><b>${esc(friendly(x.id))}</b> <span class="dim">${esc(x.status)}</span><div class="dim">${esc(x.title||'-')} ${x.artist?'- '+esc(x.artist):''}</div></div><button data-id="${esc(x.id)}" ${x.id===s.selectedAppId?'disabled':''}>Suivre</button></div>`).join('')||'<div class="dim">Aucun lecteur media detecte.</div>';
+  document.querySelectorAll('#sessions button').forEach(b=>b.onclick=()=>selectApp(b.dataset.id));
+  if(!loaded){loaded=true;
+    $('bri').value=s.espConfig.brightness;$('scr').value=s.espConfig.scrollSpeed;$('acc').value=s.espConfig.accent.toLowerCase();$('showApp').checked=s.espConfig.showApp;$('dynAcc').checked=s.espConfig.dynamicAccent!==false;$('lyrics').checked=s.espConfig.showLyrics!==false;
+    $('host').value=s.settings.espHost;$('token').value=s.settings.espToken;$('repo').value=s.settings.githubRepo;$('auto').checked=s.autostart;
+    $('briV').textContent=$('bri').value+' %';$('scrV').textContent=$('scr').value+' px/s';
+    if(s.idleConfig){const ic=s.idleConfig;$('locName').value=ic.locationName||'';$('lat').value=ic.latitude||'';$('lon').value=ic.longitude||'';$('rssUrl').value=ic.newsRssUrl||'';$('tz').value=ic.timezone||'CET-1CEST,M3.5.0,M10.5.0/3';$('nc').value=ic.newsCount||5;$('nc').value=ic.newsCount||5;$('ncV').textContent=$('nc').value;
+    $('nightOn').checked=ic.nightModeEnabled!==false;$('nightStart').value=ic.nightModeStart??22;$('nightEnd').value=ic.nightModeEnd??7;$('nightBri').value=ic.nightBrightness||8;$('dim').value=ic.dimAfterMinutes||3;$('dimBri').value=ic.dimBrightness||15;updNight();}}
+  // Meteo dans la card veille
+  const wmo={0:'☀️',1:'🌤️',2:'⛅',3:'☁️',45:'🌫️',48:'🌫️',51:'🌦️',53:'🌦️',55:'🌧️',61:'🌧️',63:'🌧️',65:'🌧️',71:'🌨️',73:'🌨️',75:'❄️',80:'🌦️',81:'🌧️',82:'⛈️',95:'⛈️',96:'⛈️',99:'⛈️'};
+  if(s.weather){const w=s.weather;$('wTemp').textContent=w.temp.toFixed(1)+'°C (ressenti '+w.feelsLike.toFixed(0)+'°C)';$('wDesc').textContent=w.description+' • '+w.location;$('wWind').textContent='💨 '+w.windSpeed.toFixed(0)+' km/h';$('wIcon').textContent=wmo[Object.keys(wmo).map(Number).filter(k=>k<=w.weatherCode).pop()]||'🌡️';}
+  else{$('wTemp').textContent='--';$('wDesc').textContent='Météo non disponible';}
+  const u=s.update;$('ubar').style.width=u.percent+'%';$('uMsg').textContent=u.message;
+}
+
+function pushCfg(){
+  $('briV').textContent=$('bri').value+' %';$('scrV').textContent=$('scr').value+' px/s';
+  clearTimeout(timer);timer=setTimeout(async()=>{
+    const r=await api('/api/esp-config',{brightness:+$('bri').value,scrollSpeed:+$('scr').value,accent:$('acc').value,showApp:$('showApp').checked,dynamicAccent:$('dynAcc').checked,showLyrics:$('lyrics').checked});
+    $('cfgMsg').textContent=r.pushed?'Applique sur la carte.':'Enregistre (la carte est injoignable, il sera applique a sa prochaine connexion).';
+  },250);
+}
+['bri','scr','acc','showApp','dynAcc','lyrics'].forEach(i=>$(i).addEventListener('input',pushCfg));
+document.querySelectorAll('.sw b').forEach(b=>b.onclick=()=>{$('acc').value=b.dataset.c.toLowerCase();pushCfg()});
+
+async function saveSettings(){
+  await api('/api/settings',{espHost:$('host').value,espToken:$('token').value,githubRepo:$('repo').value});
+  await api('/api/autostart',{enabled:$('auto').checked});
+  $('setMsg').textContent='Enregistre.';
+}
+const num=(id,d)=>{const v=parseFloat(String($(id).value).replace(',','.'));return isNaN(v)?d:v};
+function updNight(){$('nightBriV').textContent=$('nightBri').value+' %';$('dimV').textContent=$('dim').value+' min';$('dimBriV').textContent=$('dimBri').value+' %'}
+async function geo(){
+  const q=$('cityQ').value.trim();if(q.length<2)return;
+  $('cityRes').innerHTML='<div class="msg">Recherche...</div>';
+  const r=await api('/api/geocode?q='+encodeURIComponent(q));
+  const list=r.results||[];
+  $('cityRes').innerHTML=list.map((c,i)=>`<div class="row"><div class="grow">${esc(c.name)} <span class="dim">${esc([c.admin,c.country].filter(Boolean).join(', '))}</span></div><button data-i="${i}">Choisir</button></div>`).join('')||'<div class="msg">Aucun résultat.</div>';
+  $('cityRes').querySelectorAll('button').forEach(b=>b.onclick=()=>{const c=list[+b.dataset.i];$('locName').value=c.name;$('lat').value=c.latitude;$('lon').value=c.longitude;$('cityRes').innerHTML='<div class="msg">Ville choisie : pense à régler le fuseau, puis Enregistrer.</div>'});
+}
+async function wifiReset(){
+  if(!confirm('Effacer le Wi-Fi memorise dans la carte ? Elle redemarre en mode configuration.'))return;
+  const r=await api('/api/wifi-reset',{});$('setMsg').textContent=r.ok?'Carte reinitialisee : connecte-toi a NowPlaying-Setup.':'Echec (jeton ou carte injoignable).';
+}
+async function saveIdle(){
+  const r=await api('/api/idle-config',{locationName:$('locName').value,latitude:num('lat',50.8503),longitude:num('lon',4.3517),timezone:$('tz').value,newsRssUrl:$('rssUrl').value,newsCount:+$('nc').value,
+    nightModeEnabled:$('nightOn').checked,nightModeStart:+$('nightStart').value,nightModeEnd:+$('nightEnd').value,nightBrightness:+$('nightBri').value,dimAfterMinutes:+$('dim').value,dimBrightness:+$('dimBri').value});
+  const t=r.ok?(r.pushed?'Enregistré et appliqué sur la carte.':'Enregistré (carte injoignable : appliqué à sa prochaine connexion).'):'Erreur.';
+  $('idleMsg').textContent=t;$('nightMsg').textContent=t;
+}
+$('nc').addEventListener('input',()=>$('ncV').textContent=$('nc').value);
+['nightBri','dim','dimBri'].forEach(i=>$(i).addEventListener('input',updNight));
+async function checkGh(){
+  $('ghMsg').textContent='Verification...';$('ghBtn').hidden=true;
+  const r=await api('/api/update/check');
+  if(r.error){$('ghMsg').textContent=r.error;return}
+  ghUrl=r.assetUrl;
+  $('ghMsg').textContent=r.newer?('Nouvelle version disponible : '+r.tag+' (installee : '+(r.current||'?')+')'):('A jour (derniere release : '+r.tag+').');
+  $('ghBtn').hidden=!ghUrl;$('ghBtn').textContent=r.newer?'Installer '+r.tag:'Reinstaller '+r.tag;
+}
+async function flashGh(){
+  if(!confirm('Installer ce firmware sur la carte ?'))return;
+  const r=await api('/api/update/github',{url:ghUrl});if(r.error)$('uMsg').textContent=r.error;
+}
+async function flashFile(){
+  const f=$('file').files[0];if(!f){$('uMsg').textContent='Choisis d\'abord un fichier firmware.bin.';return}
+  if(!confirm('Envoyer '+f.name+' a la carte ?'))return;
+  const r=await fetch('/api/update/file',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f}).then(x=>x.json()).catch(()=>({}));
+  if(r.error)$('uMsg').textContent=r.error;
+}
+refresh();setInterval(refresh,1000);
+</script>
+</body>
+</html>
