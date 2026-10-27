@@ -67,7 +67,13 @@ input.num{width:100%;background:#10101a;border:1px solid var(--line);border-radi
     <b style="background:#0a84ff" data-c="#0A84FF"></b><b style="background:#bf5af2" data-c="#BF5AF2"></b><b style="background:#ffffff" data-c="#FFFFFF"></b></div>
   <label><input id="showApp" type="checkbox"> Afficher le nom et le logo de l'appli en haut de l'ecran</label>
   <label><input id="dynAcc" type="checkbox"> Couleur d'accent automatique (tirée de la pochette)</label>
-  <label><input id="lyrics" type="checkbox"> Paroles synchronisées (via lrclib.net : titre et artiste lui sont envoyés)</label>
+  <label><input id="lyrics" type="checkbox"> Paroles synchronisées (titre, artiste, album et durée sont envoyés aux sources cochées)</label>
+  <div style="margin:2px 0 6px 22px">
+    <label><input id="lyLrclib" type="checkbox"> LRCLIB (lrclib.net)</label>
+    <label><input id="lyNetease" type="checkbox"> NetEase Cloud Music (music.163.com) : très gros catalogue</label>
+    <label>Musixmatch : ton jeton utilisateur (optionnel)</label><input id="lyMxm" type="password" placeholder="vide = Musixmatch désactivé">
+    <div class="msg">Ordre d'essai : LRCLIB, Musixmatch, NetEase. Musixmatch ne propose pas d'API gratuite pour les paroles synchronisées : cette source utilise l'API non officielle de leur appli de bureau avec ton propre jeton (peut cesser de fonctionner à tout moment).</div>
+  </div>
   <div id="cfgMsg" class="msg"></div>
 </section>
 
@@ -147,7 +153,7 @@ const fmt=s=>{s=Math.max(0,Math.floor(s||0));const h=Math.floor(s/3600),m=Math.f
 async function api(path,body){const r=await fetch(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json().catch(()=>({}))}
 const cmd=c=>api('/api/cmd',{cmd:c});
 const selectApp=id=>api('/api/select-app',{id});
-let loaded=false,lastKey='',ghUrl='',timer=null;
+let loaded=false,lastKey='',ghUrl='',timer=null,tLy=null;
 const friendly=id=>/^[0-9A-Fa-f]{16}$/.test(id)?'Media (navigateur ?)':id.split('!')[0].split('_')[0];
 
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -170,6 +176,7 @@ async function refresh(){
   document.querySelectorAll('#sessions button').forEach(b=>b.onclick=()=>selectApp(b.dataset.id));
   if(!loaded){loaded=true;
     $('bri').value=s.espConfig.brightness;$('scr').value=s.espConfig.scrollSpeed;$('acc').value=s.espConfig.accent.toLowerCase();$('showApp').checked=s.espConfig.showApp;$('dynAcc').checked=s.espConfig.dynamicAccent!==false;$('lyrics').checked=s.espConfig.showLyrics!==false;
+    $('lyLrclib').checked=s.settings.lyricsLrclib!==false;$('lyNetease').checked=s.settings.lyricsNetease!==false;$('lyMxm').value=s.settings.musixmatchToken||'';
     $('host').value=s.settings.espHost;$('token').value=s.settings.espToken;$('repo').value=s.settings.githubRepo;$('auto').checked=s.autostart;
     $('briV').textContent=$('bri').value+' %';$('scrV').textContent=$('scr').value+' px/s';
     if(s.idleConfig){const ic=s.idleConfig;$('locName').value=ic.locationName||'';$('lat').value=ic.latitude||'';$('lon').value=ic.longitude||'';$('rssUrl').value=ic.newsRssUrl||'';$('tz').value=ic.timezone||'CET-1CEST,M3.5.0,M10.5.0/3';$('nc').value=ic.newsCount||5;$('nc').value=ic.newsCount||5;$('ncV').textContent=$('nc').value;
@@ -189,6 +196,8 @@ function pushCfg(){
   },250);
 }
 ['bri','scr','acc','showApp','dynAcc','lyrics'].forEach(i=>$(i).addEventListener('input',pushCfg));
+function pushLy(){clearTimeout(tLy);tLy=setTimeout(async()=>{await api('/api/lyrics-config',{lrclib:$('lyLrclib').checked,netease:$('lyNetease').checked,musixmatchToken:$('lyMxm').value});$('cfgMsg').textContent='Sources de paroles enregistrees.'},500)}
+['lyLrclib','lyNetease','lyMxm'].forEach(i=>$(i).addEventListener('input',pushLy));
 document.querySelectorAll('.sw b').forEach(b=>b.onclick=()=>{$('acc').value=b.dataset.c.toLowerCase();pushCfg()});
 
 async function saveSettings(){

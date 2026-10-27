@@ -25,7 +25,7 @@ public class SyncService
     string _iconId = "";
     byte[]? _iconJpeg;
 
-    readonly LyricsService _lyrics = new();
+    readonly LyricsService _lyrics;
     string _accentKey = "";
     string? _accent;
 
@@ -35,6 +35,7 @@ public class SyncService
     public SyncService(AppConfig cfg, MediaService media, EspClient esp, Updater upd, IdleService idle)
     {
         _cfg = cfg; _media = media; _esp = esp; _upd = upd; _idle = idle;
+        _lyrics = new LyricsService(cfg);
     }
 
     static string Hash(string s) =>
