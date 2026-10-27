@@ -60,7 +60,7 @@ static const int COL_X = 142, COL_W = 168;           // colonne de droite
 static const int TITLE_Y = 40, TITLE_H = 30;
 static const int ARTIST_Y = 80, ALBUM_Y = 102;
 static const int BTN_Y = 130, BTN_H = 36, BTN_W = 52, BTN_STEP = 58;  // 3 boutons
-static const int BAR_X = 10, BAR_Y = 176, BAR_W = 300, BAR_H = 40;
+static const int BAR_X = 10, BAR_Y = 166, BAR_W = 300, BAR_H = 40;
 
 // ----------------------------- Reglages persistants ------------------------
 struct Settings {
@@ -214,18 +214,18 @@ struct IdleInfo {
 
 // Config locale pour le fetch meteo/RSS sur ESP32 (stockee en Preferences)
 struct IdleNetConfig {
-  float  lat    = 50.8503f;   // Bruxelles par defaut (changeable depuis le panel)
-  float  lon    = 4.3517f;
-  String loc    = "Bruxelles";
+  float  lat    = 50.595f;
+  float  lon    = 5.117f;
+  String loc    = "Fallais";
   String rssUrl = "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr";
   String tz     = "CET-1CEST,M3.5.0,M10.5.0/3";   // fuseau POSIX
 } idleCfg;
 
 void loadIdleConfig() {
   prefs.begin("idle", true);
-  idleCfg.lat    = prefs.getFloat("ilat",  50.8503f);
-  idleCfg.lon    = prefs.getFloat("ilon",  4.3517f);
-  idleCfg.loc    = prefs.getString("iloc", "Bruxelles");
+  idleCfg.lat    = prefs.getFloat("ilat",  50.595f);
+  idleCfg.lon    = prefs.getFloat("ilon",  5.117f);
+  idleCfg.loc    = prefs.getString("iloc", "Fallais");
   idleCfg.rssUrl = prefs.getString("irss", "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr");
   idleCfg.tz     = prefs.getString("itz",  "CET-1CEST,M3.5.0,M10.5.0/3");
   prefs.end();
@@ -808,13 +808,43 @@ void tickBar(bool force = false) {
   barSpr.pushSprite(BAR_X, BAR_Y);
 }
 
+// Paroles : jusqu'a 2 lignes centrees (coupe aux espaces), zone sous la barre de progression
 void drawLyric() {
-  const int LY = 219;
-  tft.fillRect(0, LY - 1, SCR_W, SCR_H - LY + 1, C_BG);
+  const int LY_TOP = BAR_Y + BAR_H;          // 206
+  const int LY_H   = SCR_H - LY_TOP;         // 34 px = 2 lignes de police 2
+  const int LINE_H = 16;
+  const int MAXW   = SCR_W - 8;
+  tft.fillRect(0, LY_TOP, SCR_W, LY_H, C_BG);
   if (!np.lyric.length()) return;
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(C_TEXT, C_BG);
-  tft.drawString(fitText(np.lyric, 2, SCR_W - 12), SCR_W / 2, LY, 2);
+
+  String src = np.lyric, l1 = src, l2 = "";
+  if (tft.textWidth(src, 2) > MAXW) {
+    int cut = -1;                              // dernier espace qui tient sur la ligne 1
+    for (int i = 0; i < (int)src.length(); i++) {
+      if (src[i] != ' ') continue;
+      if (tft.textWidth(src.substring(0, i), 2) > MAXW) break;
+      cut = i;
+    }
+    if (cut < 0) {                             // mot trop long : coupe brutale
+      cut = src.length();
+      while (cut > 1 && tft.textWidth(src.substring(0, cut), 2) > MAXW) cut--;
+      l1 = src.substring(0, cut);
+      l2 = src.substring(cut);
+    } else {
+      l1 = src.substring(0, cut);
+      l2 = src.substring(cut + 1);
+    }
+    l2 = fitText(l2, 2, MAXW);                 // securite : "..." si ca depasse encore
+  }
+
+  if (l2.length()) {
+    tft.drawString(l1, SCR_W / 2, LY_TOP + 1, 2);
+    tft.drawString(l2, SCR_W / 2, LY_TOP + 1 + LINE_H, 2);
+  } else {
+    tft.drawString(l1, SCR_W / 2, LY_TOP + (LY_H - LINE_H) / 2, 2);   // 1 ligne : centree verticalement
+  }
 }
 
 void drawPlayScreen() {
