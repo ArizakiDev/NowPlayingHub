@@ -20,7 +20,7 @@ public class WebPanel
 
     public int Port { get; private set; }
     public string Url => $"http://localhost:{Port}/";
-    public const string AppVersion = "1.5.0";
+    public const string AppVersion = "1.1.0";
 
     public WebPanel(AppConfig cfg, MediaService media, EspClient esp, Updater upd, SyncService sync, IdleService idle)
     {
@@ -162,6 +162,17 @@ public class WebPanel
                     _cfg.GithubRepo = Str(b, "githubRepo", _cfg.GithubRepo).Trim();
                     _cfg.Save();
                     _sync.EspOnline = false;      // force une reconnexion (et un renvoi des reglages)
+                    await JsonAsync(c, new { ok = true });
+                    break;
+                }
+
+                case "POST /api/lyrics-config":
+                {
+                    var b = await BodyJsonAsync(c.Request);
+                    if (b.TryGetProperty("lrclib", out var lb) && (lb.ValueKind == JsonValueKind.True || lb.ValueKind == JsonValueKind.False)) _cfg.LyricsLrclib = lb.GetBoolean();
+                    if (b.TryGetProperty("netease", out var nb) && (nb.ValueKind == JsonValueKind.True || nb.ValueKind == JsonValueKind.False)) _cfg.LyricsNetease = nb.GetBoolean();
+                    _cfg.MusixmatchToken = Str(b, "musixmatchToken", _cfg.MusixmatchToken).Trim();
+                    _cfg.Save();
                     await JsonAsync(c, new { ok = true });
                     break;
                 }
@@ -337,7 +348,7 @@ public class WebPanel
             now = n == null ? (object?)null : new { n.State, n.Title, n.Artist, n.Album, n.Position, n.Duration, app = n.AppName, key = n.Key },
             sessions,
             selectedAppId = _cfg.SelectedAppId,
-            settings = new { espHost = _cfg.EspHost, espToken = _cfg.EspToken, githubRepo = _cfg.GithubRepo },
+            settings = new { espHost = _cfg.EspHost, espToken = _cfg.EspToken, githubRepo = _cfg.GithubRepo, lyricsLrclib = _cfg.LyricsLrclib, lyricsNetease = _cfg.LyricsNetease, musixmatchToken = _cfg.MusixmatchToken },
             espConfig = _cfg.Esp,
             update = new { busy = _upd.Status.Busy, percent = _upd.Status.Percent, message = _upd.Status.Message },
             autostart = Autostart.Get(),

@@ -19,16 +19,20 @@ public class EspSettings
 public class AppConfig
 {
     public string EspHost { get; set; } = "nowplaying.local";
-    public string EspToken { get; set; } = "change-moi";
+    public string EspToken { get; set; } = "nowplaying";
     public string SelectedAppId { get; set; } = "";   // vide = auto (Cider / Apple Music / iTunes)
     public string GithubRepo { get; set; } = "";      // "utilisateur/depot"
     public int IntervalMs { get; set; } = 1000;
+    // --- Sources de paroles (essayees dans l'ordre : LRCLIB, Musixmatch, NetEase) ---
+    public bool LyricsLrclib { get; set; } = true;
+    public bool LyricsNetease { get; set; } = true;
+    public string MusixmatchToken { get; set; } = "";   // vide = Musixmatch desactive
     public bool AsciiOnly { get; set; } = true;
     public int Port { get; set; } = 8123;
     public EspSettings Esp { get; set; } = new();
 
     // --- Ecran de veille ---
-    public double Latitude      { get; set; } = 50.8503;  // Bruxelles par defaut : change-la dans le panel
+    public double Latitude      { get; set; } = 50.8466;   // Bruxelles
     public double Longitude     { get; set; } = 4.3517;
     public string LocationName  { get; set; } = "Bruxelles";
     public string Timezone      { get; set; } = "CET-1CEST,M3.5.0,M10.5.0/3";   // format POSIX (heure d'ete incluse)
@@ -65,7 +69,7 @@ public class AppConfig
                 if (Math.Abs(cfg.Latitude) > 90 || Math.Abs(cfg.Longitude) > 180)
                 {
                     Log.Write($"config: lat/lon corrompus ({cfg.Latitude}/{cfg.Longitude}), reset aux valeurs par defaut");
-                    cfg.Latitude  = 50.8503;
+                    cfg.Latitude  = 50.8466;
                     cfg.Longitude = 4.3517;
                     cfg.Save(); // réécrire proprement
                 }
