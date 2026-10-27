@@ -54,7 +54,7 @@ pc-app\build.bat
 Tout se règle depuis le panel : ville (recherche intégrée), fuseau horaire, flux RSS, mode nuit, veille, couleur d'accent, luminosité…
 
 - **Couleur d'accent automatique** : calculée à partir de la pochette.
-- **Paroles synchronisées** : une ligne à la fois en bas de l'écran, récupérée sur [LRCLIB](https://lrclib.net). Le titre, l'artiste, l'album et la durée du morceau sont envoyés à ce service pour la recherche ; décoche l'option si tu ne le veux pas.
+- **Paroles synchronisées** : affichées en bas de l'écran sur 1 ou 2 lignes. Plusieurs sources sont essayées dans l'ordre, la première qui trouve gagne : [LRCLIB](https://lrclib.net), puis Musixmatch (optionnel, il faut renseigner ton jeton utilisateur dans le panel ; API non officielle), puis NetEase Cloud Music. Le titre, l'artiste, l'album et la durée du morceau sont envoyés aux sources activées pour la recherche ; décoche l'option (ou chaque source) si tu ne le veux pas.
 - La **météo** vient d'[Open-Meteo](https://open-meteo.com) et la recherche de ville de son API de géocodage (coordonnées de la ville envoyées, aucune clé nécessaire).
 
 La page `http://nowplaying.local` affiche l'état de la carte (version, Wi-Fi, mémoire, lecture) et permet de la redémarrer.
