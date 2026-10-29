@@ -1,5 +1,5 @@
 ﻿// ============================================================================
-//  Now Playing - ESP32-2432S028R (CYD) - firmware v1.3
+//  Now Playing - ESP32-2432S028R (CYD) - firmware v1.6
 //
 //  API HTTP (port 80) :
 //    POST /api/nowplaying  JSON {state,title,artist,album,position,duration,coverId,app,appId}
@@ -11,6 +11,11 @@
 //    POST /api/update?token=T&size=N   multipart (firmware.bin) -> mise a jour OTA
 //    POST /api/idle        JSON {temp,feelsLike,humidity,uvIndex,weatherCode,description,windSpeed,
 //                               location,sunrise,sunset,news[]}
+//    POST /api/coverbig?id=X  JPEG 240x240 en base64 (pochette plein ecran, envoyee a la demande)
+//    POST /api/pcstats     JSON {cpu,ram,disk,ramUsed,ramTotal,diskFree,down,up,uptime} (stats du PC)
+//    POST /api/sdclear     vide le cache de pochettes de la carte SD
+//    UDP  8124             spectre audio : 'V' 'Z' <n> <n octets 0-255>  (visualiseur + LED)
+//    Reponse de /api/nowplaying : {ok,needCover,needIcon,needBig,viz,cmd?}  (cmd = prev|toggle|next|seek:<sec>)
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -24,6 +29,8 @@
 #include <TFT_eSPI.h>
 #include <TJpg_Decoder.h>
 #include <XPT2046_Touchscreen.h>
+#include <SD.h>
+#include <WiFiUdp.h>
 #include "mbedtls/base64.h"
 #include "esp_wifi.h"
 #include "config.h"
@@ -36,23 +43,26 @@
 #endif
 #include <HTTPClient.h>
 // ----------------------------- Forward declarations -------------------------
-void drawIdleWeatherFull();
-void drawIdleNewsFull();
+void drawForecastScreen();
+static void ellipsizeOn(TFT_eSPI& g, const char* in, char* out, size_t cap, int maxW);
+int  fcHit(int x, int y);   // colonne de prevision touchee (-1 si aucune)
+void drawNewsScreen();
 void buildNewsTicker();
 void drawMenuScreen();
-void drawDayDetail(int day);
+void drawDayDetailScreen(int day);
+void drawIdlePcFull(bool first);
 
 
 // ----------------------------- Couleurs / layout ---------------------------
 #define RGB565(r,g,b) ((uint16_t)((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3)))
 static uint16_t cAccent = RGB565(250, 45, 72);
 #define C_ACCENT cAccent
-static const uint16_t C_BG    = RGB565(14, 14, 20);
+static const uint16_t C_BG    = 0x0000;              // noir pur #000000
 static const uint16_t C_TEXT  = 0xFFFF;
-static const uint16_t C_DIM   = RGB565(140, 140, 155);
-static const uint16_t C_TRACK = RGB565(48, 48, 60);
-static const uint16_t C_PLACE = RGB565(34, 34, 44);
-static const uint16_t C_BTN   = RGB565(38, 38, 50);
+static const uint16_t C_DIM   = RGB565(142, 142, 147);   // #8E8E93
+static const uint16_t C_TRACK = RGB565(58, 58, 60);      // #3A3A3C
+static const uint16_t C_PLACE = RGB565(28, 28, 30);      // #1C1C1E
+static const uint16_t C_BTN   = RGB565(44, 44, 46);      // #2C2C2E
 
 static const int SCR_W = 320, SCR_H = 240;
 static const int COVER_X = 10, COVER_Y = 34, COVER_SZ = 120;
@@ -64,7 +74,7 @@ static const int BAR_X = 10, BAR_Y = 166, BAR_W = 300, BAR_H = 40;
 
 // ----------------------------- Reglages persistants ------------------------
 struct Settings {
-  uint8_t  brightness = 255;
+  uint8_t  briPct     = 100;  // luminosite 5-100 %
   uint32_t accent     = 0xFA2D48;
   uint16_t scroll     = 45;
   bool     showApp    = true;
@@ -75,12 +85,21 @@ struct Settings {
   uint8_t  nightBri   = 8;    // luminosite de nuit en %
   uint8_t  dimMin     = 3;    // minutes sans toucher avant de baisser la luminosite
   uint8_t  dimBri     = 15;   // luminosite apres inactivite en %
+  // --- v1.6 ---
+  bool     autoBri    = false; // luminosite automatique (capteur de lumiere)
+  int16_t  ldrDark    = 2600;  // calibration du capteur : valeur brute (ADC) en pleine obscurite
+  int16_t  ldrBright  = 300;   //                         ... et en piece bien eclairee
+  uint8_t  ledMode    = 0;     // LED RGB : 0 eteinte, 1 couleur d'accent, 2 pulsation, 3 suit les basses
+  uint8_t  ledBri     = 40;    // luminosite de la LED en %
+  bool     ledNightOff = true; // LED eteinte pendant le mode nuit
+  bool     sdCache    = false; // cache de pochettes sur carte SD
+  uint16_t sdMax      = 150;   // nombre de pistes gardees dans le cache
 } cfg;
 Preferences prefs;
 
 void loadSettings() {
   prefs.begin("np", true);
-  cfg.brightness = prefs.getUChar("bri", 255);
+  cfg.briPct     = prefs.getUChar("bPc", 100);
   cfg.accent     = prefs.getUInt("acc", 0xFA2D48);
   cfg.scroll     = prefs.getUShort("scr", 45);
   cfg.showApp    = prefs.getBool("app", true);
@@ -90,11 +109,19 @@ void loadSettings() {
   cfg.nightBri   = prefs.getUChar("nBr", 8);
   cfg.dimMin     = prefs.getUChar("dMi", 3);
   cfg.dimBri     = prefs.getUChar("dBr", 15);
+  cfg.autoBri    = prefs.getBool("aBr", false);
+  cfg.ldrDark    = prefs.getShort("ldD", 2600);
+  cfg.ldrBright  = prefs.getShort("ldB", 300);
+  cfg.ledMode    = prefs.getUChar("lMo", 0);
+  cfg.ledBri     = prefs.getUChar("lBr", 40);
+  cfg.ledNightOff = prefs.getBool("lNo", true);
+  cfg.sdCache    = prefs.getBool("sdC", false);
+  cfg.sdMax      = prefs.getUShort("sdM", 150);
   prefs.end();
 }
 void saveSettings() {
   prefs.begin("np", false);
-  prefs.putUChar("bri", cfg.brightness);
+  prefs.putUChar("bPc", cfg.briPct);
   prefs.putUInt("acc", cfg.accent);
   prefs.putUShort("scr", cfg.scroll);
   prefs.putBool("app", cfg.showApp);
@@ -104,6 +131,14 @@ void saveSettings() {
   prefs.putUChar("nBr", cfg.nightBri);
   prefs.putUChar("dMi", cfg.dimMin);
   prefs.putUChar("dBr", cfg.dimBri);
+  prefs.putBool("aBr", cfg.autoBri);
+  prefs.putShort("ldD", cfg.ldrDark);
+  prefs.putShort("ldB", cfg.ldrBright);
+  prefs.putUChar("lMo", cfg.ledMode);
+  prefs.putUChar("lBr", cfg.ledBri);
+  prefs.putBool("lNo", cfg.ledNightOff);
+  prefs.putBool("sdC", cfg.sdCache);
+  prefs.putUShort("sdM", cfg.sdMax);
   prefs.end();
 }
 uint32_t dynAccent = 0;   // couleur tiree de la pochette (0 = inactive), envoyee par l'appli PC
@@ -120,15 +155,51 @@ void applyAccent() {
   static void blInit()          { ledcSetup(7, 5000, 8); ledcAttachPin(TFT_BL, 7); }
   static void blWrite(uint8_t v){ ledcWrite(7, v); }
 #endif
+static uint8_t pctToPwm(int pct) { return (uint8_t)constrain(pct * 255 / 100, 13, 255); }
 void applyBrightness() {
-  blWrite(constrain((int)cfg.brightness, 13, 255));
+  blWrite(pctToPwm(cfg.briPct));
 }
+
+// Capteur de lumiere (LDR) du CYD : GPIO 34. La calibration (obscurite / lumiere) se fait depuis le panel,
+// ce qui marche quel que soit le sens du capteur (valeur qui monte ou qui descend avec la lumiere).
+static const int LDR_PIN = 34;
+static int   ldrRaw = 0;
+static float ldrAvg = -1;
+static void tickLdr() {
+  static uint32_t t = 0;
+  if (millis() - t < 150) return;
+  t = millis();
+  ldrRaw = analogRead(LDR_PIN);
+  ldrAvg = (ldrAvg < 0) ? (float)ldrRaw : ldrAvg * 0.85f + ldrRaw * 0.15f;
+}
+// 0.0 = sombre ... 1.0 = lumineux
+static float ldrLight() {
+  if (ldrAvg < 0) return 1.0f;
+  float d = (float)cfg.ldrDark, b = (float)cfg.ldrBright;
+  if (fabsf(b - d) < 50.0f) return 1.0f;
+  return constrain((ldrAvg - d) / (b - d), 0.0f, 1.0f);
+}
+
+// LED RGB du CYD : GPIO 4 (R), 16 (G), 17 (B), allumee a l'etat bas
+static const int LED_R = 4, LED_G = 16, LED_B = 17;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  static void ledInit() { ledcAttach(LED_R, 5000, 8); ledcAttach(LED_G, 5000, 8); ledcAttach(LED_B, 5000, 8); }
+  static void ledPwm(uint8_t r, uint8_t g, uint8_t b) { ledcWrite(LED_R, 255 - r); ledcWrite(LED_G, 255 - g); ledcWrite(LED_B, 255 - b); }
+#else
+  static void ledInit() {
+    ledcSetup(1, 5000, 8); ledcSetup(2, 5000, 8); ledcSetup(3, 5000, 8);
+    ledcAttachPin(LED_R, 1); ledcAttachPin(LED_G, 2); ledcAttachPin(LED_B, 3);
+  }
+  static void ledPwm(uint8_t r, uint8_t g, uint8_t b) { ledcWrite(1, 255 - r); ledcWrite(2, 255 - g); ledcWrite(3, 255 - b); }
+#endif
 
 // ----------------------------- Objets globaux -----------------------------
 TFT_eSPI    tft;
 TFT_eSprite titleSpr(&tft);
 TFT_eSprite barSpr(&tft);
 TFT_eSprite eqSpr(&tft);
+#include "Utf8Ascii.h"         // cleanUTF8() : accents -> ASCII
+#include "ModernDashboard.h"   // v1.7 : ecran de veille moderne (cartes + sprites)
 WebServer   server(80);
 SPIClass    touchSPI(VSPI);
 XPT2046_Touchscreen ts(33, 36);   // CS, IRQ
@@ -137,7 +208,7 @@ XPT2046_Touchscreen ts(33, 36);   // CS, IRQ
 struct Track {
   String title, artist, album, state = "stopped", coverId, app, appId;
   float  duration = 0;
-  String lyric;
+  String lyric, lyricPrev, lyricNext;
 } np;
 bool lyricDirty = false;
 float    basePos = 0;
@@ -153,7 +224,7 @@ uint32_t cmdMs = 0;
 int      flashIdx = -1;        // bouton surligne
 uint32_t flashUntil = 0;
 
-enum Screen { SCR_NONE, SCR_WIFI, SCR_WAIT, SCR_PLAY, SCR_IDLE_WX, SCR_IDLE_NEWS, SCR_MENU };
+enum Screen { SCR_NONE, SCR_WIFI, SCR_WAIT, SCR_PLAY, SCR_IDLE_WX, SCR_IDLE_NEWS, SCR_MENU, SCR_IDLE_PC };
 Screen cur = SCR_NONE;
 
 bool trackDirty = false, coverDirty = false, stateDirty = false, headerDirty = false;
@@ -188,6 +259,75 @@ int      lastClockMin = -1; // pour le redessin de l'heure dans le header
 // ----------------------------- Fullscreen pochette -------------------------
 bool fullCover = false;
 
+// ----------------------------- v1.6 : modes d'affichage, pochette HD, spectre, stats PC, LED
+bool     vizMode   = false;     // ecran visualiseur de spectre
+bool     lyricFull = false;     // paroles en grand
+bool     bigDirty  = false;     // pochette plein ecran a redessiner
+uint8_t* bigBuf    = nullptr;   // pochette 240x240
+size_t   bigLen    = 0;
+String   bigIdStored;
+static bool gNight = false;     // mode nuit actif (calcule par tickAutoDim)
+
+struct PcStats {
+  bool valid = false; uint32_t ms = 0;
+  uint8_t cpu = 0, ram = 0, disk = 0;
+  float ramUsed = 0, ramTotal = 0, diskFree = 0;     // Go
+  uint32_t down = 0, up = 0;                         // Ko/s
+  uint32_t uptimeMin = 0;
+} pcs;
+static bool pcLineDirty = false, pcPageDirty = false;
+static bool pcsFresh() { return pcs.valid && millis() - pcs.ms < 20000; }
+
+static const uint16_t VIZ_PORT = 8124;
+static const int VIZ_MAX = 32;
+WiFiUDP  vizUdp;
+bool     vizUdpOn = false;
+static uint8_t  vizLvl[VIZ_MAX];
+static int      vizN = 0;
+static uint32_t vizRxMs = 0, vizPkts = 0;
+static float    vizBass = 0;
+
+static void pollViz() {
+  if (!vizUdpOn) return;
+  for (int guard = 0; guard < 6 && vizUdp.parsePacket() > 0; guard++) {
+    uint8_t buf[VIZ_MAX + 4];
+    int n = vizUdp.read(buf, sizeof(buf));
+    if (n < 4 || buf[0] != 'V' || buf[1] != 'Z') continue;
+    int cnt = min((int)buf[2], min(VIZ_MAX, n - 3));
+    if (cnt < 3) continue;
+    memcpy(vizLvl, buf + 3, cnt);
+    vizN = cnt;
+    vizRxMs = millis();
+    vizPkts++;
+    float b = (vizLvl[0] + vizLvl[1] + vizLvl[2]) / (3.0f * 255.0f);
+    vizBass = max(b, vizBass * 0.8f);
+  }
+}
+// Le PC n'envoie le spectre que si la carte le demande (reponse a /api/nowplaying)
+static bool wantViz() { return cur == SCR_PLAY && np.state == "playing" && (vizMode || cfg.ledMode == 3); }
+
+static void tickLed() {
+  static uint32_t t = 0;
+  if (millis() - t < 30) return;
+  t = millis();
+  float k = 0;
+  bool show = cfg.ledMode != 0 && cur == SCR_PLAY && !(cfg.ledNightOff && gNight);
+  if (show) {
+    float breath = 0.45f + 0.55f * (0.5f + 0.5f * sinf(millis() / 1000.0f * 2.2f));
+    if (np.state != "playing")      k = 0.15f;
+    else if (cfg.ledMode == 1)      k = 1.0f;
+    else if (cfg.ledMode == 2)      k = breath;
+    else {
+      bool live = vizN > 0 && millis() - vizRxMs < 600;
+      k = live ? constrain(0.08f + vizBass, 0.0f, 1.0f) : breath;
+      vizBass *= 0.9f;
+    }
+  }
+  uint32_t a = dynAccent ? dynAccent : cfg.accent;
+  float s = powf(k * cfg.ledBri / 100.0f, 1.8f);
+  ledPwm((uint8_t)(((a >> 16) & 0xFF) * s), (uint8_t)(((a >> 8) & 0xFF) * s), (uint8_t)((a & 0xFF) * s));
+}
+
 // ----------------------------- Pause -> Idle --------------------------------
 uint32_t pausedSince  = 0;   // millis() quand la piste est passee en pause
 bool     forcedIdle   = false; // true si on est en idle force par pause prolongee
@@ -216,7 +356,7 @@ struct IdleInfo {
 struct IdleNetConfig {
   float  lat    = 50.595f;
   float  lon    = 5.117f;
-  String loc    = "Fallais";
+  String loc    = "Bruxelles";
   String rssUrl = "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr";
   String tz     = "CET-1CEST,M3.5.0,M10.5.0/3";   // fuseau POSIX
 } idleCfg;
@@ -225,7 +365,7 @@ void loadIdleConfig() {
   prefs.begin("idle", true);
   idleCfg.lat    = prefs.getFloat("ilat",  50.595f);
   idleCfg.lon    = prefs.getFloat("ilon",  5.117f);
-  idleCfg.loc    = prefs.getString("iloc", "Fallais");
+  idleCfg.loc    = prefs.getString("iloc", "Bruxelles");
   idleCfg.rssUrl = prefs.getString("irss", "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr");
   idleCfg.tz     = prefs.getString("itz",  "CET-1CEST,M3.5.0,M10.5.0/3");
   prefs.end();
@@ -247,14 +387,14 @@ static bool     firstFetchDone = false;
 
 // ----------------------------- Layout Idle (utilise des le fetch) -----------
 static const int IDLE_NEWS_BAND = 0;   // news tout en haut
-static const int IDLE_NEWS_H   = 20;
+static const int IDLE_NEWS_H   = 36;   // zone tactile du bandeau d'actus
 static const int IDLE_TOPBAR_Y = 22;   // WiFi bars + hint
 static const int IDLE_CLK_Y    = 30;   // horloge
 static const int IDLE_CLK_FONT = 7;
 static const int IDLE_DATE_Y   = 104;  // date
 static const int IDLE_SEP_Y    = 122;  // separateur accent
-static const int IDLE_WX_Y     = 128;  // meteo
-static const int IDLE_WX_H     = 108;  // grande zone meteo
+static const int IDLE_WX_Y     = 42;   // cartes heure/meteo (zone tactile)
+static const int IDLE_WX_H     = 188;
 static const int IDLE_NEWS_Y   = IDLE_NEWS_BAND; // alias compat
 static const int IDLE_IP_Y     = 236;
 static bool     idleDrawn     = false;
@@ -403,6 +543,34 @@ String fitText(String s, int font, int maxW) {
   return s + "...";
 }
 
+// Coupe s en lignes (aux espaces) ; la derniere ligne est tronquee avec "..." si ca depasse encore
+static int wrapText(const String& s, int font, int maxW, int maxLines, String* out) {
+  String rest = s;
+  rest.trim();
+  int n = 0;
+  while (rest.length() && n < maxLines) {
+    if (tft.textWidth(rest, font) <= maxW) { out[n++] = rest; break; }
+    if (n == maxLines - 1) { out[n++] = fitText(rest, font, maxW); break; }
+    int cut = -1;                                   // dernier espace qui tient sur la ligne
+    for (int i = 0; i < (int)rest.length(); i++) {
+      if (rest[i] != ' ') continue;
+      if (tft.textWidth(rest.substring(0, i), font) > maxW) break;
+      cut = i;
+    }
+    if (cut <= 0) {                                 // mot trop long : coupe brutale
+      cut = rest.length();
+      while (cut > 1 && tft.textWidth(rest.substring(0, cut), font) > maxW) cut--;
+      out[n++] = rest.substring(0, cut);
+      rest = rest.substring(cut);
+    } else {
+      out[n++] = rest.substring(0, cut);
+      rest = rest.substring(cut + 1);
+    }
+    rest.trim();
+  }
+  return n;
+}
+
 bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   if (y >= tft.height()) return false;
   tft.pushImage(x, y, w, h, bitmap);
@@ -417,6 +585,126 @@ bool decodeJpegBody(uint8_t* buf, size_t cap, size_t& outLen) {
   if (rc != 0 || o < 4 || buf[0] != 0xFF || buf[1] != 0xD8) { outLen = 0; return false; }
   outLen = o;
   return true;
+}
+
+
+// ----------------------------- Cache de pochettes sur carte SD (optionnel) --
+// Le lecteur SD du CYD est sur le bus VSPI (CS 5, SCK 18, MISO 19, MOSI 23), le meme peripherique que le
+// tactile (CLK 25, MISO 39, MOSI 32). Les deux sont donc "re-attaches" avant chaque acces a l'un ou l'autre.
+static const int SD_CS = 5, SD_SCK = 18, SD_MISO = 19, SD_MOSI = 23;
+static SPIClass sdSPI(VSPI);
+static bool     sdOk = false, sdBusDirty = false;
+static uint32_t sdCount = 0;
+static uint32_t sdSizeMB = 0;
+static const char* SD_DIR_S = "/np_s";    // petites pochettes (120x120)
+static const char* SD_DIR_B = "/np_b";    // grandes pochettes (240x240)
+
+static void sdBus()    { sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS); sdBusDirty = true; }
+static void touchBus() { if (sdBusDirty) { touchSPI.begin(25, 39, 32, 33); sdBusDirty = false; } }
+
+static void sdMount() {
+  sdOk = false;
+  sdBus();
+  if (!SD.begin(SD_CS, sdSPI, 20000000) || SD.cardType() == CARD_NONE) {
+    Serial.println("[sd] pas de carte");
+    return;
+  }
+  sdOk = true;
+  sdSizeMB = (uint32_t)(SD.cardSize() / (1024ULL * 1024ULL));
+  SD.mkdir(SD_DIR_S);
+  SD.mkdir(SD_DIR_B);
+  sdCount = 0;
+  const char* dirs[2] = { SD_DIR_S, SD_DIR_B };
+  for (int k = 0; k < 2; k++) {
+    File d = SD.open(dirs[k]);
+    if (!d) continue;
+    File f = d.openNextFile();
+    while (f) { sdCount++; f.close(); f = d.openNextFile(); }
+    d.close();
+  }
+  Serial.printf("[sd] carte OK : %u Mo, %u fichiers en cache\n", (unsigned)sdSizeMB, (unsigned)sdCount);
+}
+
+static String sdName(const char* dir, const String& id) {
+  String o;
+  for (size_t i = 0; i < id.length() && o.length() < 24; i++) {
+    char c = id[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_') o += c;
+  }
+  if (!o.length()) return "";
+  return String(dir) + "/" + o + ".jpg";
+}
+
+static bool sdLoad(const char* dir, const String& id, uint8_t* buf, size_t cap, size_t& outLen) {
+  if (!sdOk || !cfg.sdCache || !buf) return false;
+  String p = sdName(dir, id);
+  if (!p.length()) return false;
+  sdBus();
+  File f = SD.open(p, FILE_READ);
+  if (!f) return false;
+  size_t n = f.size();
+  bool ok = n > 4 && n <= cap && f.read(buf, n) == n && buf[0] == 0xFF && buf[1] == 0xD8;
+  f.close();
+  if (ok) outLen = n;
+  return ok;
+}
+
+// Quand le cache est plein : supprime les premiers fichiers (la FAT les range a peu pres par ordre de creation)
+static void sdPrune() {
+  uint32_t target = (uint32_t)cfg.sdMax * 2 * 9 / 10;
+  const char* dirs[2] = { SD_DIR_S, SD_DIR_B };
+  while (sdCount > target) {
+    String victims[24];
+    int got = 0;
+    for (int k = 0; k < 2 && got < 24; k++) {
+      File d = SD.open(dirs[k]);
+      if (!d) continue;
+      File f = d.openNextFile();
+      while (f && got < 24) { victims[got++] = String(f.path()); f.close(); f = d.openNextFile(); }
+      if (f) f.close();
+      d.close();
+    }
+    if (!got) break;
+    bool any = false;
+    for (int i = 0; i < got; i++) if (SD.remove(victims[i])) { any = true; if (sdCount) sdCount--; }
+    if (!any) break;
+  }
+}
+
+static void sdSave(const char* dir, const String& id, const uint8_t* buf, size_t len) {
+  if (!sdOk || !cfg.sdCache || !buf || len == 0) return;
+  String p = sdName(dir, id);
+  if (!p.length()) return;
+  sdBus();
+  if (SD.exists(p)) return;
+  File f = SD.open(p, FILE_WRITE);
+  if (!f) return;
+  size_t w = f.write(buf, len);
+  f.close();
+  if (w != len) { SD.remove(p); return; }
+  sdCount++;
+  if (sdCount > (uint32_t)cfg.sdMax * 2) sdPrune();
+}
+
+static void sdClear() {
+  if (!sdOk) return;
+  sdBus();
+  const char* dirs[2] = { SD_DIR_S, SD_DIR_B };
+  for (int pass = 0; pass < 40; pass++) {             // 40 x 24 fichiers max par appel
+    String victims[24];
+    int got = 0;
+    for (int k = 0; k < 2 && got < 24; k++) {
+      File d = SD.open(dirs[k]);
+      if (!d) continue;
+      File f = d.openNextFile();
+      while (f && got < 24) { victims[got++] = String(f.path()); f.close(); f = d.openNextFile(); }
+      if (f) f.close();
+      d.close();
+    }
+    if (!got) break;
+    for (int i = 0; i < got; i++) SD.remove(victims[i]);
+  }
+  sdCount = 0;
 }
 
 
@@ -575,85 +863,71 @@ void drawIdleWeather() {
   tft.drawString(idleData.location, SCR_W-4, IDLE_WX_Y + IDLE_WX_H - 10, 1);
 }
 
-void drawIdleScreen() {
-  tft.fillScreen(C_BG);
-  // Bandeau news tout en haut
-  tft.fillRect(0, IDLE_NEWS_BAND, SCR_W, IDLE_NEWS_H, RGB565(12,12,22));
-  tft.fillRect(0, IDLE_NEWS_H, SCR_W, 2, C_TRACK);
-  // Hint double-tap discret
-  if (forcedIdle && hasTrack) {
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(RGB565(45,45,65), C_BG);
-    tft.drawString("2x tap", SCR_W-4, IDLE_TOPBAR_Y + 2, 1);
+// Ligne tres discrete (stats du PC) en bas a gauche de l'ecran de veille ; un tap dessus ouvre la page "Mon PC"
+void drawIdlePcLine() {
+  tft.fillRect(0, 230, 215, 10, C_BG);
+  if (!pcsFresh()) return;
+  char b[48];
+  snprintf(b, sizeof(b), "PC  cpu %u%%  ram %u%%  dsk %u%%", pcs.cpu, pcs.ram, pcs.disk);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(RGB565(72, 78, 105), C_BG);
+  tft.drawString(b, 4, 232, 1);
+}
+static void tickIdlePcLine() {
+  static bool shown = false;
+  bool f = pcsFresh();
+  if (pcLineDirty || f != shown) { pcLineDirty = false; shown = f; drawIdlePcLine(); }
+}
+
+// ---- Ecran de veille v1.7 : voir ModernDashboard.h ------------------------
+// Remplit la structure d'affichage a partir de l'heure NTP et de idleData (aucune String creee ici)
+static void fillDashData(ui::DashboardData& d) {
+  struct tm tm;
+  d.timeValid = getLocalTime(&tm, 0) && tm.tm_year > 100;
+  if (d.timeValid) {
+    d.hour = tm.tm_hour; d.minute = tm.tm_min; d.second = tm.tm_sec;
+    d.wday = tm.tm_wday; d.mday = tm.tm_mday; d.month = tm.tm_mon + 1;
   }
-  // Horloge + date
-  drawIdleClock();
-  drawIdleDate();
-  // Separateur avant meteo
-  tft.fillRect(24, IDLE_SEP_Y, SCR_W-48, 2, C_ACCENT);
-  // Meteo
-  drawIdleWeather();
-  // IP discret
+  ui::WeatherData& w = d.wx;
+  w.valid = idleData.hasData;
+  if (w.valid) {
+    w.tempC    = (int8_t)lroundf(idleData.temp);
+    w.feelsC   = (int8_t)lroundf(idleData.feelsLike);
+    w.windKmh  = (uint8_t)constrain((int)lroundf(idleData.windSpeed), 0, 255);
+    w.humidity = (uint8_t)constrain((int)lroundf(idleData.humidity), 0, 100);
+    w.icon     = ui::wmoToIcon(idleData.weatherCode);
+    strlcpy(w.label, idleData.description.c_str(), sizeof(w.label));
+  }
+  // Bandeau : actus si dispo, sinon le nom du lieu
+  d.ticker = (idleData.newsCount > 0 && newsFullStr.length()) ? newsFullStr.c_str()
+                                                              : idleData.location.c_str();
+}
+
+void drawHomeScreen() {
+  static ui::DashboardData d;
+  fillDashData(d);
+  g_dashboard.invalidate();              // fond + cartes redessines
+  drawModernDashboard(d);
+  tft.setTextFont(1);   // les free fonts restent actives sinon : tout drawString(...,1) du firmware serait faux
+  // Elements discrets sous les cartes (y >= 230)
+  tft.fillRect(215, 230, 105, 10, C_BG);
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(RGB565(38,38,52), C_BG);
   tft.drawString(WiFi.localIP().toString(), SCR_W-4, IDLE_IP_Y, 1);
+  drawIdlePcLine();
   if (idleData.newsCount > 0) buildNewsTicker();
   idleDrawn    = true;
   lastWifiDraw = 0;
 }
 
-void updateIdleClock() {
-  drawIdleClock();
-  drawIdleDate();
-  tft.fillRect(24, IDLE_SEP_Y, SCR_W-48, 2, C_ACCENT);
-}
-
-void tickNewsTicker() {
-  if (idleData.newsCount == 0 || newsFullStr.length() == 0) return;
-  static uint32_t lastTick = 0;
-  if (millis() - lastTick < 40) return;
-  lastTick = millis();
-  static TFT_eSprite* tickerSpr = nullptr;
-  if (!tickerSpr) {
-    tickerSpr = new TFT_eSprite(&tft);
-    tickerSpr->createSprite(SCR_W, 18);
-  }
-  int fullW = tft.textWidth(newsFullStr, 2);
-  tickerSpr->fillSprite(C_BG);
-  tickerSpr->setTextDatum(TL_DATUM);
-  tickerSpr->setTextColor(RGB565(160,165,195), C_BG);
-  tickerSpr->drawString(newsFullStr, -newsTickerOffset, 1, 2);
-  if (fullW > 0)
-    tickerSpr->drawString(newsFullStr, -newsTickerOffset + fullW + 40, 1, 2);
-  // pushSprite dans la zone news (bandeau au-dessus de la meteo)
-  tickerSpr->pushSprite(0, IDLE_NEWS_BAND + 1);
-  newsTickerOffset++;
-  if (fullW > 0 && newsTickerOffset >= fullW + 40) newsTickerOffset = 0;
-}
-
 void animateIdle() {
-  if (!idleDrawn) { drawIdleScreen(); return; }
-  if (millis() - lastSecsDraw > 1000) {
-    lastSecsDraw = millis();
-    struct tm tm;
-    if (getLocalTime(&tm, 0) && tm.tm_year > 100) {
-      if (tm.tm_sec != idleClockSec) {
-        idleClockSec = tm.tm_sec;
-        if (tm.tm_min != idleClockMin) {
-          updateIdleClock();
-        } else {
-          String clk = clockStr();
-          int clkW = tft.textWidth(clk, IDLE_CLK_FONT);
-          int secX = SCR_W / 2 + clkW / 2 + 5;
-          tft.fillRect(secX, IDLE_CLK_Y + 50, 28, 14, C_BG);
-          tft.setTextDatum(TL_DATUM);
-          tft.setTextColor(C_DIM, C_BG);
-          tft.drawString(secsStr(), secX, IDLE_CLK_Y + 52, 2);
-        }
-      }
-    }
-  }
-  tickNewsTicker();
+  if (!idleDrawn) { drawHomeScreen(); return; }
+  static ui::DashboardData d;
+  static uint32_t lastFill = 0;
+  uint32_t now = millis();
+  if (now - lastFill >= 100) { lastFill = now; fillDashData(d); }   // heure/meteo : 10x/s suffit
+  drawModernDashboard(d);                                           // sprites : ne redessine que ce qui change
+  tickIdlePcLine();
 }
 
 
@@ -685,23 +959,25 @@ void drawHeader() {
   drawStateIcon();
 }
 
+// Boutons : conteneurs #2C2C2E arrondis + icones blanches en primitives (triangles / barres arrondies)
 void drawButtons(int hi = -1) {
   for (int i = 0; i < 3; i++) {
-    int x = COL_X + i * BTN_STEP, cx = x + BTN_W / 2, cy = BTN_Y + BTN_H / 2;
-    tft.fillRoundRect(x, BTN_Y, BTN_W, BTN_H, 8, (i == hi) ? C_ACCENT : C_BTN);
-    if (i == 0) {                       // precedent
-      tft.fillRect(cx - 9, cy - 8, 3, 16, C_TEXT);
-      tft.fillTriangle(cx + 9, cy - 8, cx + 9, cy + 8, cx - 5, cy, C_TEXT);
-    } else if (i == 1) {                // pause si lecture, sinon play
+    const int x = COL_X + i * BTN_STEP, cx = x + BTN_W / 2, cy = BTN_Y + BTN_H / 2;
+    const uint16_t bg = (i == hi) ? C_ACCENT : C_BTN;
+    tft.fillRoundRect(x, BTN_Y, BTN_W, BTN_H, 10, bg);
+    if (i == 0) {                         // precedent : 2 triangles vers la gauche
+      tft.fillTriangle(cx - 1, cy - 8, cx - 1, cy + 8, cx - 11, cy, C_TEXT);
+      tft.fillTriangle(cx + 10, cy - 8, cx + 10, cy + 8, cx, cy, C_TEXT);
+    } else if (i == 1) {                  // pause si lecture, sinon play
       if (np.state == "playing") {
-        tft.fillRect(cx - 7, cy - 8, 5, 16, C_TEXT);
-        tft.fillRect(cx + 2, cy - 8, 5, 16, C_TEXT);
+        tft.fillRoundRect(cx - 8, cy - 9, 6, 18, 2, C_TEXT);
+        tft.fillRoundRect(cx + 2, cy - 9, 6, 18, 2, C_TEXT);
       } else {
-        tft.fillTriangle(cx - 6, cy - 9, cx - 6, cy + 9, cx + 8, cy, C_TEXT);
+        tft.fillTriangle(cx - 6, cy - 10, cx - 6, cy + 10, cx + 9, cy, C_TEXT);
       }
-    } else {                            // suivant
-      tft.fillTriangle(cx - 9, cy - 8, cx - 9, cy + 8, cx + 5, cy, C_TEXT);
-      tft.fillRect(cx + 6, cy - 8, 3, 16, C_TEXT);
+    } else {                              // suivant : 2 triangles vers la droite
+      tft.fillTriangle(cx - 10, cy - 8, cx - 10, cy + 8, cx, cy, C_TEXT);
+      tft.fillTriangle(cx + 1, cy - 8, cx + 1, cy + 8, cx + 11, cy, C_TEXT);
     }
   }
 }
@@ -716,59 +992,77 @@ void drawCover() {
   tft.fillTriangle(cx + 6, cy - 32, cx + 28, cy - 20, cx + 6, cy - 8, C_DIM);
 }
 
-// Dessin pochette plein ecran (200x200 centree)
+// Pochette plein ecran : 240x240 (envoyee a la demande par le PC), sinon la petite pochette centree en attendant
 void drawFullCoverScreen() {
   tft.fillScreen(C_BG);
+  bool bigOk = bigBuf && bigLen > 0 && np.coverId.length() && bigIdStored == np.coverId;
+  if (bigOk) {
+    TJpgDec.drawJpg((SCR_W - 240) / 2, 0, bigBuf, bigLen);
+    return;
+  }
   bool ok = coverLen > 0 && np.coverId.length() && coverIdStored == np.coverId;
+  int cx = (SCR_W - COVER_SZ) / 2;
+  int cy = (SCR_H - COVER_SZ) / 2;
   if (ok) {
-    // On decode le JPEG directement a la taille originale (120x120) et on le place centre
-    // Pour un vrai scale up il faudrait un decoder supplementaire; on place simplement au centre
-    int cx = (SCR_W - COVER_SZ) / 2;
-    int cy = (SCR_H - COVER_SZ) / 2;
     TJpgDec.drawJpg(cx, cy, coverBuf, coverLen);
   } else {
-    // Placeholder centre
-    int cx = (SCR_W - COVER_SZ) / 2;
-    int cy = (SCR_H - COVER_SZ) / 2;
     tft.fillRoundRect(cx, cy, COVER_SZ, COVER_SZ, 10, C_PLACE);
     int icx = cx + COVER_SZ / 2, icy = cy + COVER_SZ / 2;
     tft.fillCircle(icx - 10, icy + 22, 12, C_DIM);
     tft.fillRect(icx + 1, icy - 32, 5, 54, C_DIM);
     tft.fillTriangle(icx + 6, icy - 32, icx + 28, icy - 20, icx + 6, icy - 8, C_DIM);
   }
-  // Indication de retour (petit texte en bas)
   tft.setTextDatum(BC_DATUM);
   tft.setTextColor(RGB565(60, 60, 75), C_BG);
-  tft.drawString("Tap pour revenir", SCR_W / 2, SCR_H - 4, 2);
+  tft.drawString("Chargement HD...", SCR_W / 2, SCR_H - 4, 2);
 }
 
 void drawArtistAlbum() {
+  char line[96];
   tft.fillRect(COL_X, ARTIST_Y - 2, COL_W, 48, C_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(C_TEXT, C_BG);
-  tft.drawString(fitText(np.artist, 2, COL_W), COL_X, ARTIST_Y, 2);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextDatum(ML_DATUM);
+  ellipsizeOn(tft, np.artist.c_str(), line, sizeof(line), COL_W);
   tft.setTextColor(C_DIM, C_BG);
-  tft.drawString(fitText(np.album, 2, COL_W), COL_X, ALBUM_Y, 2);
+  tft.drawString(line, COL_X, ARTIST_Y + 9);
+  ellipsizeOn(tft, np.album.c_str(), line, sizeof(line), COL_W);
+  tft.setTextColor(RGB565(99, 99, 102), C_BG);                     // #636366
+  tft.drawString(line, COL_X, ALBUM_Y + 9);
+  tft.setTextFont(1);                                              // rend la police GLCD au reste du firmware
 }
+
+// TITLE_SCROLL 1 : defilement fluide si le titre depasse (clippe par le sprite, ne touche jamais l'heure)
+//               0 : titre fixe tronque avec "..."
+#ifndef TITLE_SCROLL
+#define TITLE_SCROLL 1
+#endif
 
 void renderTitleSprite(int off) {
   titleSpr.fillSprite(C_BG);
+  titleSpr.setFreeFont(&FreeSansBold12pt7b);
   titleSpr.setTextDatum(TL_DATUM);
   titleSpr.setTextColor(C_TEXT, C_BG);
-  titleSpr.drawString(np.title, -off, 2, 4);
-  if (titleW > COL_W) titleSpr.drawString(np.title, -off + titleW + 40, 2, 4);
+  if (!TITLE_SCROLL && titleW > COL_W) {
+    char line[96];
+    ellipsizeOn(titleSpr, np.title.c_str(), line, sizeof(line), COL_W);
+    titleSpr.drawString(line, 0, 2);
+  } else {
+    titleSpr.drawString(np.title.c_str(), -off, 2);
+    if (titleW > COL_W) titleSpr.drawString(np.title.c_str(), -off + titleW + 40, 2);
+  }
   titleSpr.pushSprite(COL_X, TITLE_Y);
 }
 
 void layoutTitle() {
-  titleW = tft.textWidth(np.title, 4);
+  titleSpr.setFreeFont(&FreeSansBold12pt7b);
+  titleW = titleSpr.textWidth(np.title.c_str());
   titleStaticDrawn = false;
   scrollStart = millis();
   lastOff = -9999;
 }
 
 void tickTitle() {
-  if (titleW <= COL_W) {
+  if (!TITLE_SCROLL || titleW <= COL_W) {
     if (!titleStaticDrawn) { renderTitleSprite(0); titleStaticDrawn = true; }
     return;
   }
@@ -793,11 +1087,13 @@ void tickBar(bool force = false) {
   lastSec = sec;
 
   barSpr.fillSprite(C_BG);
-  barSpr.fillRoundRect(0, 4, BAR_W, 6, 3, C_TRACK);
+  // Barre fine (3 px) : piste #3A3A3C, partie lue blanche, petit curseur rond
+  barSpr.fillRoundRect(0, 6, BAR_W, 3, 1, C_TRACK);
   int fw = (np.duration > 0) ? (int)(BAR_W * pos / np.duration) : 0;
-  if (fw >= 6)     barSpr.fillRoundRect(0, 4, fw, 6, 3, C_ACCENT);
-  else if (fw > 0) barSpr.fillRect(0, 4, fw, 6, C_ACCENT);
-  if (fw > 0)      barSpr.fillCircle(constrain(fw, 5, BAR_W - 5), 7, 5, C_TEXT);
+  if (fw > BAR_W) fw = BAR_W;
+  if (fw >= 3)     barSpr.fillRoundRect(0, 6, fw, 3, 1, C_TEXT);
+  else if (fw > 0) barSpr.fillRect(0, 6, fw, 3, C_TEXT);
+  barSpr.fillSmoothCircle(constrain(fw, 4, BAR_W - 4), 7, 4, C_TEXT, C_BG);
 
   char a[12], b[12];
   fmtTime(sec, a, sizeof(a));
@@ -808,46 +1104,136 @@ void tickBar(bool force = false) {
   barSpr.pushSprite(BAR_X, BAR_Y);
 }
 
-// Paroles : jusqu'a 2 lignes centrees (coupe aux espaces), zone sous la barre de progression
+// Paroles : jusqu'a 2 lignes centrees, zone sous la barre de progression
 void drawLyric() {
   const int LY_TOP = BAR_Y + BAR_H;          // 206
   const int LY_H   = SCR_H - LY_TOP;         // 34 px = 2 lignes de police 2
   const int LINE_H = 16;
-  const int MAXW   = SCR_W - 8;
   tft.fillRect(0, LY_TOP, SCR_W, LY_H, C_BG);
   if (!np.lyric.length()) return;
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(C_TEXT, C_BG);
-
-  String src = np.lyric, l1 = src, l2 = "";
-  if (tft.textWidth(src, 2) > MAXW) {
-    int cut = -1;                              // dernier espace qui tient sur la ligne 1
-    for (int i = 0; i < (int)src.length(); i++) {
-      if (src[i] != ' ') continue;
-      if (tft.textWidth(src.substring(0, i), 2) > MAXW) break;
-      cut = i;
-    }
-    if (cut < 0) {                             // mot trop long : coupe brutale
-      cut = src.length();
-      while (cut > 1 && tft.textWidth(src.substring(0, cut), 2) > MAXW) cut--;
-      l1 = src.substring(0, cut);
-      l2 = src.substring(cut);
-    } else {
-      l1 = src.substring(0, cut);
-      l2 = src.substring(cut + 1);
-    }
-    l2 = fitText(l2, 2, MAXW);                 // securite : "..." si ca depasse encore
-  }
-
-  if (l2.length()) {
-    tft.drawString(l1, SCR_W / 2, LY_TOP + 1, 2);
-    tft.drawString(l2, SCR_W / 2, LY_TOP + 1 + LINE_H, 2);
-  } else {
-    tft.drawString(l1, SCR_W / 2, LY_TOP + (LY_H - LINE_H) / 2, 2);   // 1 ligne : centree verticalement
+  String l[2];
+  int n = wrapText(np.lyric, 2, SCR_W - 8, 2, l);
+  if (n >= 2) {
+    tft.drawString(l[0], SCR_W / 2, LY_TOP + 1, 2);
+    tft.drawString(l[1], SCR_W / 2, LY_TOP + 1 + LINE_H, 2);
+  } else if (n == 1) {
+    tft.drawString(l[0], SCR_W / 2, LY_TOP + (LY_H - LINE_H) / 2, 2);   // 1 ligne : centree verticalement
   }
 }
 
-void drawPlayScreen() {
+// ----------------------------- Paroles plein ecran --------------------------
+void drawLyricFull() {
+  tft.fillScreen(C_BG);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString(fitText(np.title + " - " + np.artist, 1, SCR_W - 16), SCR_W / 2, 4, 1);
+
+  String l[4];
+  // ligne precedente (en haut, grisee, 2 lignes max, alignee sur le bas de sa zone)
+  int pn = wrapText(np.lyricPrev, 2, SCR_W - 20, 2, l);
+  for (int i = 0; i < pn; i++) tft.drawString(l[i], SCR_W / 2, 56 - (pn - i) * 16, 2);
+
+  // ligne en cours (grande, 4 lignes max, centree verticalement)
+  tft.setTextColor(C_TEXT, C_BG);
+  int n = wrapText(np.lyric.length() ? np.lyric : String("..."), 4, SCR_W - 16, 4, l);
+  int y0 = 62 + (112 - n * 26) / 2;
+  for (int i = 0; i < n; i++) tft.drawString(l[i], SCR_W / 2, y0 + i * 26, 4);
+
+  // ligne suivante (en bas, grisee)
+  tft.setTextColor(C_DIM, C_BG);
+  int nn = wrapText(np.lyricNext, 2, SCR_W - 20, 2, l);
+  for (int i = 0; i < nn; i++) tft.drawString(l[i], SCR_W / 2, 182 + i * 16, 2);
+}
+
+// fine barre de progression en bas de l'ecran des paroles
+void tickLyricBar() {
+  static int lastS = -1;
+  int s = (int)curPos();
+  if (s == lastS) return;
+  lastS = s;
+  const int y = SCR_H - 3;
+  tft.fillRect(0, y, SCR_W, 3, C_TRACK);
+  if (np.duration > 0) tft.fillRect(0, y, (int)(SCR_W * curPos() / np.duration), 3, C_ACCENT);
+}
+
+void renderLyricFull() {
+  if (trackDirty) { trackDirty = false; coverDirty = false; lyricDirty = true; }   // nouveau titre : tout redessiner
+  if (lyricDirty) { lyricDirty = false; drawLyricFull(); }
+  tickLyricBar();
+}
+
+// ----------------------------- Visualiseur de spectre -----------------------
+static const int VZ_X0 = 10, VZ_W = 300, VZ_BASE = 214, VZ_H = 160;
+static int      vzH[VIZ_MAX], vzPeak[VIZ_MAX];
+static uint32_t vzPeakMs[VIZ_MAX];
+static bool     vzMsgShown = false;
+
+static void drawVizHeader() {
+  tft.fillRect(0, 0, SCR_W, 40, C_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_TEXT, C_BG);
+  tft.drawString(fitText(np.title, 2, SCR_W - 20), 10, 4, 2);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString(fitText(np.artist, 2, SCR_W - 20), 10, 21, 2);
+}
+
+void drawVizScreen() {
+  tft.fillScreen(C_BG);
+  drawVizHeader();
+  tft.fillRect(VZ_X0, VZ_BASE + 2, VZ_W, 1, C_TRACK);
+  tft.setTextDatum(BC_DATUM);
+  tft.setTextColor(RGB565(60, 60, 75), C_BG);
+  tft.drawString("Tap pour revenir", SCR_W / 2, SCR_H - 3, 1);
+  for (int i = 0; i < VIZ_MAX; i++) { vzH[i] = 0; vzPeak[i] = 0; vzPeakMs[i] = 0; }
+  vzMsgShown = false;
+}
+
+void renderViz() {
+  if (trackDirty) { trackDirty = false; coverDirty = false; drawVizHeader(); }
+  static uint32_t lastDraw = 0;
+  if (millis() - lastDraw < 33) return;
+  lastDraw = millis();
+
+  bool live = vizN > 0 && millis() - vizRxMs < 1500;
+  int n = (vizN > 0) ? vizN : 24;
+  int bw = VZ_W / n;
+  bool allZero = true;
+  for (int i = 0; i < n; i++) {
+    int target = live ? (int)vizLvl[i] * VZ_H / 255 : 0;
+    int h = vzH[i];
+    if (target >= h) h = target;                                // montee immediate
+    else             h = max(target, h - max(3, (h - target) / 4));   // descente progressive
+    if (h > 0) allZero = false;
+
+    int oldPeak = vzPeak[i], peak = oldPeak;
+    if (h >= peak) { peak = h; vzPeakMs[i] = millis(); }
+    else if (millis() - vzPeakMs[i] > 350) peak = max(h, peak - 2);
+
+    if (h == vzH[i] && peak == oldPeak) continue;
+    int x = VZ_X0 + i * bw, w = max(1, bw - 2);
+    if (oldPeak > 0) tft.fillRect(x, VZ_BASE - oldPeak - 3, w, 3, C_BG);        // efface l'ancien chapeau
+    if (h > vzH[i])      tft.fillRect(x, VZ_BASE - h, w, h - vzH[i], C_ACCENT);
+    else if (h < vzH[i]) tft.fillRect(x, VZ_BASE - vzH[i], w, vzH[i] - h, C_BG);
+    if (peak > 0) tft.fillRect(x, VZ_BASE - peak - 3, w, 3, C_TEXT);            // chapeau
+    vzH[i] = h; vzPeak[i] = peak;
+  }
+  // message quand aucun signal n'arrive (appli PC sans visualiseur, rien de joue...)
+  bool showMsg = !live && allZero;
+  if (showMsg != vzMsgShown) {
+    vzMsgShown = showMsg;
+    tft.setTextDatum(MC_DATUM);
+    if (showMsg) {
+      tft.setTextColor(C_DIM, C_BG);
+      tft.drawString("En attente du signal audio...", SCR_W / 2, 120, 2);
+    } else {
+      tft.fillRect(0, 100, SCR_W, 40, C_BG);
+    }
+  }
+}
+
+void drawMusicScreen() {
   tft.fillScreen(C_BG);
   drawHeader();
   drawButtons();
@@ -859,9 +1245,12 @@ void drawPlayScreen() {
 
 void renderPlay() {
   if (fullCover) {
-    // En mode plein ecran pochette, pas de mise a jour normale
+    // En mode plein ecran pochette, pas de mise a jour normale (sauf quand la version HD arrive)
+    if (bigDirty) { bigDirty = false; drawFullCoverScreen(); }
     return;
   }
+  if (vizMode)   { renderViz(); return; }
+  if (lyricFull) { renderLyricFull(); return; }
   if (headerDirty) { headerDirty = false; drawHeader(); }
   if (trackDirty)  { trackDirty = false; layoutTitle(); drawArtistAlbum(); }
   if (coverDirty)  { coverDirty = false; drawCover(); }
@@ -928,11 +1317,11 @@ void animateWait() {
   }
 }
 
-// ----------------------------- Auto-dim + Mode nuit -----------------------
+// ----------------------------- Auto-dim + Mode nuit + luminosite auto ------
 bool autoDimReset = true;   // true -> reapplique la luminosite au prochain tick
 void tickAutoDim() {
   static bool dimmed = false;
-  static bool nightMode = false;
+  static int  lastPwm = -1;
 
   // Mode nuit via l'heure NTP (gere aussi les plages qui passent minuit, ex. 22h -> 7h)
   bool isNight = false;
@@ -946,21 +1335,23 @@ void tickAutoDim() {
 
   const uint8_t nightPwm = (uint8_t)max(3, (int)cfg.nightBri * 255 / 100);
   const uint8_t dimPwm   = (uint8_t)max(3, (int)cfg.dimBri   * 255 / 100);
-  const uint8_t normPwm  = (uint8_t)constrain((int)cfg.brightness, 13, 255);
-  const bool shouldDim   = (millis() - lastTouchMs > (uint32_t)cfg.dimMin * 60000UL);
-
-  if (autoDimReset || isNight != nightMode) {
-    autoDimReset = false;
-    nightMode = isNight;
-    dimmed = shouldDim;
-    blWrite(nightMode ? nightPwm : (dimmed ? dimPwm : normPwm));
-    return;
+  uint8_t normPwm = pctToPwm(cfg.briPct);
+  if (cfg.autoBri) {
+    // entre 10 % (obscurite) et le reglage de luminosite (piece eclairee)
+    float pct = 10.0f + ((float)cfg.briPct - 10.0f) * powf(ldrLight(), 0.7f);
+    normPwm = pctToPwm((int)(pct + 0.5f));
   }
-  if (nightMode) { blWrite(nightPwm); return; }
+  const bool shouldDim = (millis() - lastTouchMs > (uint32_t)cfg.dimMin * 60000UL);
 
-  if (shouldDim == dimmed) return;
+  uint8_t want = isNight ? nightPwm : (shouldDim ? (uint8_t)min((int)dimPwm, (int)normPwm) : normPwm);
+  bool stateChange = autoDimReset || isNight != gNight || shouldDim != dimmed;
+  if (stateChange || abs((int)want - lastPwm) >= (cfg.autoBri ? 3 : 1)) {
+    blWrite(want);
+    lastPwm = want;
+  }
+  autoDimReset = false;
+  gNight = isNight;
   dimmed = shouldDim;
-  blWrite(dimmed ? dimPwm : normPwm);
 }
 
 // ----------------------------- Tactile -------------------------------------
@@ -973,53 +1364,81 @@ void pressButton(int i) {
   drawButtons(i);
 }
 
+// Fin d'un toucher sur l'ecran lecture : sortie des modes plein ecran, balayage, ou tap sur une zone
+static void onPlayRelease(int sx, int sy, int ex, int ey) {
+  int dx = ex - sx, dy = ey - sy;
+  if (fullCover) { fullCover = false; drawMusicScreen(); return; }
+  if (vizMode)   { vizMode   = false; drawMusicScreen(); return; }
+  if (lyricFull) { lyricFull = false; drawMusicScreen(); return; }
+  if (abs(dx) > 40 && abs(dx) > abs(dy)) {                  // balayage : droite = prev, gauche = next
+    pressButton(dx > 0 ? 0 : 2);
+    return;
+  }
+  if (abs(dx) > 18 || abs(dy) > 18) return;                 // glissement ambigu : on ignore
+
+  // Tap pochette -> plein ecran
+  if (sx >= COVER_X && sx <= COVER_X + COVER_SZ && sy >= COVER_Y && sy <= COVER_Y + COVER_SZ) {
+    fullCover = true; drawFullCoverScreen(); return;
+  }
+  // Tap sur le bloc artiste / album -> visualiseur de spectre
+  if (sx >= COL_X && sy >= ARTIST_Y - 6 && sy < BTN_Y - 6) {
+    vizMode = true; drawVizScreen(); return;
+  }
+  // Tap sur la barre de progression -> se deplacer dans le morceau
+  if (sy >= BAR_Y + 2 && sy <= BAR_Y + 26 && np.duration > 0) {
+    float frac = constrain((float)(ex - BAR_X) / (float)BAR_W, 0.0f, 1.0f);
+    float secs = frac * np.duration;
+    pendingCmd = "seek:" + String(secs, 1);
+    cmdMs = millis();
+    basePos = secs; baseMs = millis();                      // retour visuel immediat
+    tickBar(true);
+    return;
+  }
+  // Tap sur les paroles -> paroles en grand
+  if (sy >= BAR_Y + 34 && (np.lyric.length() || np.lyricPrev.length() || np.lyricNext.length())) {
+    lyricFull = true; lyricDirty = false; drawLyricFull(); return;
+  }
+}
+
 void handleTouch() {
   static bool     down   = false;
   static uint32_t last   = 0;
-  static int      startX = -1;
-  static int      startY = -1;
+  static int      startX = -1, startY = -1;   // debut du toucher
+  static int      lastX  = -1, lastY  = -1;   // derniere position vue pendant le toucher
   static uint32_t lastIdleTap = 0;  // pour double-tap sur idle
 
+  touchBus();                       // le tactile partage le bus SPI avec la carte SD
   if (!ts.touched()) {
-    if (down) {
-      if (cur == SCR_PLAY && startX >= 0) {
-        TS_Point p = ts.getPoint();
-        int endX = map(p.x, 200, 3700, 1, SCR_W);
-        int endY = map(p.y, 240, 3800, 1, SCR_H);
-        int dx = endX - startX, dy = endY - startY;
-        if (fullCover) {
-          fullCover = false; drawPlayScreen(); coverDirty = true; trackDirty = true;
-        } else if (abs(dx) > 40 && abs(dx) > abs(dy)) {
-          pressButton(dx > 0 ? 0 : 2);  // droite=prev, gauche=next
-        }
-      }
-    }
+    if (down && cur == SCR_PLAY && startX >= 0) onPlayRelease(startX, startY, lastX, lastY);
     down = false; startX = startY = -1;
     return;
   }
 
   lastTouchMs = millis();
+  {
+    TS_Point p0 = ts.getPoint();
+    lastX = map(p0.x, 200, 3700, 1, SCR_W);
+    lastY = map(p0.y, 240, 3800, 1, SCR_H);
+  }
 
   if (down || millis() - last < 250) return;
   down = true;
   last = millis();
 
-  TS_Point p = ts.getPoint();
-  int x = map(p.x, 200, 3700, 1, SCR_W);
-  int y = map(p.y, 240, 3800, 1, SCR_H);
+  int x = lastX, y = lastY;
 
   // Ecran MENU
   if (cur == SCR_MENU) {
     // Bouton + brightness (zone droite)
     if (x > SCR_W-50 && y > 80 && y < 130) {
-      cfg.brightness = constrain((int)cfg.brightness + 20, 13, 255);
-      saveSettings(); applyBrightness();
+      cfg.briPct = constrain((int)cfg.briPct + 10, 5, 100);
+      saveSettings(); applyBrightness(); autoDimReset = true;
       drawMenuScreen(); return;
     }
     // Bouton - brightness (zone gauche)
     if (x < 50 && y > 80 && y < 130) {
-      cfg.brightness = constrain((int)cfg.brightness - 20, 13, 255);
-      saveSettings(); applyBrightness();
+      cfg.briPct = constrain((int)cfg.briPct - 10, 5, 100);
+      saveSettings(); applyBrightness(); autoDimReset = true;
       drawMenuScreen(); return;
     }
     // Bouton Reboot
@@ -1032,14 +1451,13 @@ void handleTouch() {
   if (cur == SCR_IDLE_WX) {
     // Si on a un detail jour affiche
     if (wxDetailDay >= 0) {
-      wxDetailDay = -1; drawIdleWeatherFull(); return;
+      wxDetailDay = -1; drawForecastScreen(); return;
     }
     // Tap sur zone previsions (bas) -> detail du jour
-    if (y > 150 && idleData.forecastDays > 0) {
-      int col = x / (SCR_W / idleData.forecastDays);
-      col = constrain(col, 0, idleData.forecastDays - 1);
+    int col = fcHit(x, y);
+    if (col >= 0) {
       wxDetailDay = col;
-      drawDayDetail(col); return;
+      drawDayDetailScreen(col); return;
     }
     // Double-tap sur zone superieure -> retour idle
     uint32_t now = millis();
@@ -1053,7 +1471,7 @@ void handleTouch() {
     }
     return;
   }
-  if (cur == SCR_IDLE_NEWS) {
+  if (cur == SCR_IDLE_NEWS || cur == SCR_IDLE_PC) {
     uint32_t now = millis();
     if (now - lastDetailTap < 600) {
       cur = SCR_WAIT; idleDrawn = false;
@@ -1077,11 +1495,15 @@ void handleTouch() {
       lastIdleTap = 0; return;
     }
     lastIdleTap = now;
+    // Raccourci : la ligne discrete en bas a gauche ouvre la page "Mon PC"
+    if (pcsFresh() && y >= 224 && x < 215) {
+      cur = SCR_IDLE_PC; drawIdlePcFull(true); return;
+    }
     if (y >= IDLE_NEWS_BAND && y <= IDLE_NEWS_BAND + IDLE_NEWS_H) {
-      cur = SCR_IDLE_NEWS; drawIdleNewsFull(); return;
+      cur = SCR_IDLE_NEWS; drawNewsScreen(); return;
     }
     if (y >= IDLE_WX_Y && y <= IDLE_WX_Y + IDLE_WX_H) {
-      cur = SCR_IDLE_WX; drawIdleWeatherFull(); return;
+      cur = SCR_IDLE_WX; drawForecastScreen(); return;
     }
     return;
   }
@@ -1089,28 +1511,26 @@ void handleTouch() {
   if (cur != SCR_PLAY) return;
 
   startX = x; startY = y;
-  if (fullCover) return;
+  if (fullCover || vizMode || lyricFull) return;           // la sortie se fait au relacher
 
-  // Tap pochette â†’ fullscreen
-  if (x >= COVER_X && x <= COVER_X + COVER_SZ && y >= COVER_Y && y <= COVER_Y + COVER_SZ) {
-    fullCover = true; drawFullCoverScreen(); return;
-  }
-
-  // Boutons
-  if (y >= BTN_Y - 6 && y <= BTN_Y + BTN_H + 6) {
+  // Boutons : reagissent des l'appui
+  if (y >= BTN_Y - 6 && y <= BTN_Y + BTN_H + 1) {
     for (int i = 0; i < 3; i++) {
       int bx = COL_X + i * BTN_STEP;
-      if (x >= bx - 4 && x <= bx + BTN_W + 4) { pressButton(i); return; }
+      if (x >= bx - 4 && x <= bx + BTN_W + 4) { startX = -1; pressButton(i); return; }
     }
   }
+  // Le reste (pochette, visualiseur, barre, paroles, balayages) est traite dans onPlayRelease()
 }
 
 // ----------------------------- Handlers HTTP -------------------------------
-void sendReply(bool needCover, bool needIcon) {
+void sendReply(bool needCover, bool needIcon, bool needBig = false) {
   JsonDocument r;
   r["ok"] = true;
   r["needCover"] = needCover;
   r["needIcon"] = needIcon;
+  r["needBig"] = needBig;
+  r["viz"] = wantViz();
   if (pendingCmd.length()) {
     if (millis() - cmdMs < 4000) r["cmd"] = pendingCmd;   // commande trop vieille = ignoree
     pendingCmd = "";
@@ -1132,19 +1552,22 @@ void handleNowPlaying() {
     np.state = "stopped";
     hasTrack = false;
     if (dynAccent) { dynAccent = 0; applyAccent(); }
-    np.lyric = "";
+    np.lyric = ""; np.lyricPrev = ""; np.lyricNext = "";
     sendReply(false, false);
     return;
   }
 
-  String title = d["title"] | "", artist = d["artist"] | "", album = d["album"] | "";
+  String title  = cleanUTF8((const char*)(d["title"]  | "")),
+         artist = cleanUTF8((const char*)(d["artist"] | "")),
+         album  = cleanUTF8((const char*)(d["album"]  | ""));
   String cid = d["coverId"] | "", app = d["app"] | "", appId = d["appId"] | "";
   bool changed = !hasTrack || title != np.title || artist != np.artist || album != np.album;
   if (changed) {
     np.title = title; np.artist = artist; np.album = album; np.coverId = cid;
-    np.lyric = ""; lyricDirty = true;
+    np.lyric = ""; np.lyricPrev = ""; np.lyricNext = ""; lyricDirty = true;
     trackDirty = true;
     coverDirty = true;
+    if (fullCover) bigDirty = true;
   }
   if (app != np.app || appId != np.appId) { np.app = app; np.appId = appId; headerDirty = true; }
   if (np.state != st) {
@@ -1162,16 +1585,28 @@ void handleNowPlaying() {
   }
   // Ligne de paroles en cours (optionnelle)
   {
-    String ly = d["lyric"] | "";
-    if (ly != np.lyric) { np.lyric = ly; lyricDirty = true; }
+    String ly = d["lyric"] | "", lp = d["lyricPrev"] | "", ln = d["lyricNext"] | "";
+    if (ly != np.lyric || lp != np.lyricPrev || ln != np.lyricNext) {
+      np.lyric = ly; np.lyricPrev = lp; np.lyricNext = ln; lyricDirty = true;
+    }
   }
   np.duration = d["duration"] | 0.0f;
   basePos = d["position"] | 0.0f;
   baseMs = millis();
   hasTrack = true;
 
-  sendReply(cid.length() > 0 && cid != coverIdStored,
-            cfg.showApp && appId.length() > 0 && appId != iconIdStored);
+  // Pochette : d'abord le cache SD, sinon on la demande au PC
+  bool needCover = cid.length() > 0 && cid != coverIdStored;
+  if (needCover && sdLoad(SD_DIR_S, cid, coverBuf, COVER_MAX_BYTES, coverLen)) {
+    coverIdStored = cid; coverDirty = true; needCover = false;
+  }
+  // Pochette HD : seulement quand on est en plein ecran
+  bool needBig = false;
+  if (fullCover && bigBuf && cid.length() > 0 && cid != bigIdStored) {
+    if (sdLoad(SD_DIR_B, cid, bigBuf, BIG_MAX_BYTES, bigLen)) { bigIdStored = cid; bigDirty = true; }
+    else needBig = true;
+  }
+  sendReply(needCover, cfg.showApp && appId.length() > 0 && appId != iconIdStored, needBig);
 }
 
 void handleCover() {
@@ -1181,6 +1616,18 @@ void handleCover() {
   }
   coverIdStored = server.arg("id");
   coverDirty = true;
+  sdSave(SD_DIR_S, coverIdStored, coverBuf, coverLen);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleBigCover() {
+  if (!bigBuf || !decodeJpegBody(bigBuf, BIG_MAX_BYTES, bigLen)) {
+    server.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+  bigIdStored = server.arg("id");
+  bigDirty = true;
+  sdSave(SD_DIR_B, bigIdStored, bigBuf, bigLen);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1198,7 +1645,13 @@ void sendConfig() {
   JsonDocument d;
   char hex[8];
   snprintf(hex, sizeof(hex), "#%06X", (unsigned)(cfg.accent & 0xFFFFFF));
-  d["brightness"] = cfg.brightness;
+  d["brightness"] = cfg.briPct;
+  d["autoBri"] = cfg.autoBri;
+  d["ledMode"] = cfg.ledMode;
+  d["ledBri"] = cfg.ledBri;
+  d["ledNightOff"] = cfg.ledNightOff;
+  d["sdCache"] = cfg.sdCache;
+  d["sdMax"] = cfg.sdMax;
   d["accent"] = hex;
   d["scrollSpeed"] = cfg.scroll;
   d["showApp"] = cfg.showApp;
@@ -1220,7 +1673,20 @@ void handleConfigPost() {
     server.send(400, "application/json", "{\"ok\":false}");
     return;
   }
-  if (!d["brightness"].isNull()) cfg.brightness = (uint8_t)constrain(d["brightness"].as<int>(), 5, 100);
+  if (!d["brightness"].isNull()) cfg.briPct = (uint8_t)constrain(d["brightness"].as<int>(), 5, 100);
+  if (!d["autoBri"].isNull())    cfg.autoBri    = d["autoBri"].as<bool>();
+  if (!d["ledMode"].isNull())    cfg.ledMode    = (uint8_t)constrain(d["ledMode"].as<int>(), 0, 3);
+  if (!d["ledBri"].isNull())     cfg.ledBri     = (uint8_t)constrain(d["ledBri"].as<int>(), 5, 100);
+  if (!d["ledNightOff"].isNull()) cfg.ledNightOff = d["ledNightOff"].as<bool>();
+  if (!d["sdCache"].isNull())    cfg.sdCache    = d["sdCache"].as<bool>();
+  if (!d["sdMax"].isNull())      cfg.sdMax      = (uint16_t)constrain(d["sdMax"].as<int>(), 20, 1000);
+  bool calOnly = false;
+  if (!d["ldrCal"].isNull()) {                       // calibration du capteur de lumiere depuis le panel
+    String w = d["ldrCal"].as<String>();
+    if (ldrAvg >= 0 && w == "dark")   cfg.ldrDark   = (int16_t)ldrAvg;
+    if (ldrAvg >= 0 && w == "bright") cfg.ldrBright = (int16_t)ldrAvg;
+    calOnly = true;
+  }
   if (!d["scrollSpeed"].isNull()) cfg.scroll = (uint16_t)constrain(d["scrollSpeed"].as<int>(), 10, 150);
   if (!d["showApp"].isNull()) cfg.showApp = d["showApp"].as<bool>();
   if (!d["nightOn"].isNull())    cfg.nightOn    = d["nightOn"].as<bool>();
@@ -1237,7 +1703,8 @@ void handleConfigPost() {
   applyBrightness();
   applyAccent();
   autoDimReset = true;
-  cur = SCR_NONE;                     // force un redessin complet avec les nouveaux reglages
+  if (cfg.sdCache && !sdOk) sdMount();
+  if (!calOnly) cur = SCR_NONE;       // force un redessin complet avec les nouveaux reglages
   sendConfig();
 }
 
@@ -1249,9 +1716,58 @@ void handleStatus() {
   d["heap"] = ESP.getFreeHeap();
   d["rssi"] = WiFi.RSSI();
   d["uptime"] = millis() / 1000;
+  d["maxAlloc"] = ESP.getMaxAllocHeap();
+  d["cpuMhz"] = ESP.getCpuFreqMHz();
+  d["chipTemp"] = temperatureRead();
+  d["screen"] = (cur == SCR_PLAY) ? (fullCover ? "cover" : vizMode ? "viz" : lyricFull ? "lyrics" : "play")
+              : (cur == SCR_WAIT) ? "idle" : (cur == SCR_IDLE_WX) ? "weather" : (cur == SCR_IDLE_NEWS) ? "news"
+              : (cur == SCR_IDLE_PC) ? "pc" : (cur == SCR_MENU) ? "menu" : "wifi";
+  d["title"] = hasTrack ? np.title : "";
+  d["artist"] = hasTrack ? np.artist : "";
+  d["brightnessPct"] = cfg.briPct;
+  d["ldrRaw"] = ldrRaw;
+  d["ldrLight"] = (int)(ldrLight() * 100);
+  d["ldrDark"] = cfg.ldrDark;
+  d["ldrBright"] = cfg.ldrBright;
+  d["autoBri"] = cfg.autoBri;
+  d["night"] = gNight;
+  d["ledMode"] = cfg.ledMode;
+  d["viz"] = (vizN > 0 && millis() - vizRxMs < 1500);
+  d["vizPackets"] = vizPkts;
+  d["sd"]["enabled"] = cfg.sdCache;
+  d["sd"]["ok"] = sdOk;
+  d["sd"]["sizeMB"] = sdSizeMB;
+  d["sd"]["files"] = sdCount;
+  d["bigCover"] = (bigLen > 0 && bigIdStored == np.coverId);
+  d["pcStats"] = pcsFresh();
   String out;
   serializeJson(d, out);
   server.send(200, "application/json", out);
+}
+
+void handleSdClear() {
+  sdClear();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handlePcStats() {
+  JsonDocument d;
+  if (!server.hasArg("plain") || deserializeJson(d, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+  pcs.cpu  = (uint8_t)constrain(d["cpu"]  | 0, 0, 100);
+  pcs.ram  = (uint8_t)constrain(d["ram"]  | 0, 0, 100);
+  pcs.disk = (uint8_t)constrain(d["disk"] | 0, 0, 100);
+  pcs.ramUsed  = d["ramUsed"]  | 0.0f;
+  pcs.ramTotal = d["ramTotal"] | 0.0f;
+  pcs.diskFree = d["diskFree"] | 0.0f;
+  pcs.down = d["down"] | 0;
+  pcs.up   = d["up"]   | 0;
+  pcs.uptimeMin = d["uptime"] | 0;
+  pcs.ms = millis(); pcs.valid = true;
+  pcLineDirty = true; pcPageDirty = true;
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleIdle() {
@@ -1266,9 +1782,9 @@ void handleIdle() {
   idleData.humidity    = d["humidity"]    | 0.0f;
   idleData.uvIndex     = d["uvIndex"]     | -1.0f;
   idleData.weatherCode = d["weatherCode"] | -1;
-  idleData.description = (const char*)(d["description"] | "");
+  idleData.description = cleanUTF8((const char*)(d["description"] | ""));
   idleData.windSpeed   = d["windSpeed"]   | 0.0f;
-  idleData.location    = (const char*)(d["location"]    | "");
+  idleData.location    = cleanUTF8((const char*)(d["location"]    | ""));
   idleData.sunrise     = (const char*)(d["sunrise"]     | "");
   idleData.sunset      = (const char*)(d["sunset"]      | "");
   // hasWeather = true si le PC a vraiment de la meteo (pas juste des zeros)
@@ -1280,7 +1796,7 @@ void handleIdle() {
   JsonArray arr = d["news"].as<JsonArray>();
   for (JsonVariant v : arr) {
     if (idleData.newsCount >= 10) break;
-    idleData.news[idleData.newsCount++] = v.as<String>();
+    idleData.news[idleData.newsCount++] = cleanUTF8(v.as<String>());
   }
 
   Serial.printf("[idle] temp=%.1f code=%d hasData=%d loc=%s news=%d\n",
@@ -1290,133 +1806,224 @@ void handleIdle() {
   // Forcer le redessin de l'ecran idle si on est dessus
   if (cur == SCR_WAIT) {
     idleDrawn = false;
+  } else if (cur == SCR_IDLE_WX && wxDetailDay < 0) {
+    drawForecastScreen();          // la page semaine suit les nouvelles donnees
+  } else if (cur == SCR_IDLE_NEWS) {
+    drawNewsScreen();
   }
 
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// ----------------------------- Ecran meteo plein format --------------------
-void drawIdleWeatherFull() {
-  tft.fillScreen(C_BG);
-  // --- Header compact ---
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(C_ACCENT, C_BG);
-  tft.drawString("METEO", SCR_W/2, 2, 2);
+// ----------------------------- Page "Mon PC" (stats envoyees par l'appli PC) ----
+static String fmtRate(uint32_t kbs) {
+  char b[20];
+  if (kbs >= 1024) snprintf(b, sizeof(b), "%.1f Mo/s", kbs / 1024.0f);
+  else             snprintf(b, sizeof(b), "%u Ko/s", (unsigned)kbs);
+  return String(b);
+}
+static void pcBar(int y, int pct) {
+  const int W = SCR_W - 24;
+  tft.fillRoundRect(12, y, W, 8, 4, C_TRACK);
+  int w = constrain(pct, 0, 100) * W / 100;
+  if (w >= 8)     tft.fillRoundRect(12, y, w, 8, 4, pct >= 90 ? RGB565(235, 80, 60) : C_ACCENT);
+  else if (w > 0) tft.fillRect(12, y, w, 8, C_ACCENT);
+}
+static void pcRow(int y, const char* label, const String& value) {
+  tft.fillRect(0, y, SCR_W, 17, C_BG);
+  tft.setTextDatum(TL_DATUM);
   tft.setTextColor(C_DIM, C_BG);
-  tft.drawString(idleData.location, SCR_W/2, 16, 1);
-  tft.fillRect(20, 26, SCR_W-40, 1, C_ACCENT);
-
-  if (!idleData.hasData) {
-    tft.setTextColor(C_DIM, C_BG);
-    tft.drawString("Meteo indisponible", SCR_W/2, 110, 2);
-  } else {
-    // Temperature : font 6 a gauche, icone a droite
-    char tempBuf[10];
-    snprintf(tempBuf, sizeof(tempBuf), "%.0fC", idleData.temp);
+  tft.drawString(label, 12, y, 2);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(C_TEXT, C_BG);
+  tft.drawString(value, SCR_W - 12, y, 2);
+}
+void drawIdlePcFull(bool first) {
+  if (first) {
+    tft.fillScreen(C_BG);
     tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(C_TEXT, C_BG);
-    tft.drawString(tempBuf, 90, 28, 6);
-    // Icone a droite de la temperature
-    drawWeatherIconLarge(240, 56, idleData.weatherCode);
-    // Description font 2 sous la temp
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextColor(C_TEXT, C_BG);
-    tft.drawString(fitText(idleData.description, 2, 180), 90, 80, 2);
-    // Ligne ressenti + humidite
-    char buf[48];
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(C_DIM, C_BG);
-    snprintf(buf, sizeof(buf), "Res. %.0fC", idleData.feelsLike);
-    tft.drawString(buf, 8, 96, 2);
-    snprintf(buf, sizeof(buf), "Hum %.0f%%", idleData.humidity);
-    tft.setTextDatum(TR_DATUM);
-    tft.drawString(buf, SCR_W-8, 96, 2);
-    // Vent + UV
-    tft.setTextDatum(TL_DATUM);
-    snprintf(buf, sizeof(buf), "Vent %.0f km/h", idleData.windSpeed);
-    tft.drawString(buf, 8, 112, 2);
-    if (idleData.uvIndex >= 0) {
-      snprintf(buf, sizeof(buf), "UV %.0f", idleData.uvIndex);
-      tft.setTextDatum(TR_DATUM);
-      tft.setTextColor(RGB565(180,120,220), C_BG);
-      tft.drawString(buf, SCR_W-8, 112, 2);
-    }
-    // Lever / Coucher
-    if (idleData.sunrise.length() && idleData.sunset.length()) {
-      tft.setTextDatum(TC_DATUM);
-      tft.setTextColor(RGB565(210,160,50), C_BG);
-      snprintf(buf, sizeof(buf), "Lever %s  Coucher %s", idleData.sunrise.c_str(), idleData.sunset.c_str());
-      tft.drawString(buf, SCR_W/2, 128, 2);
-    }
+    tft.setTextColor(C_ACCENT, C_BG);
+    tft.drawString("MON PC", SCR_W / 2, 6, 4);
   }
-
-  // --- Previsions 7 jours ---
-  tft.fillRect(0, 148, SCR_W, 1, C_TRACK);
-  if (idleData.forecastDays > 0) {
-    static const char* dayShort[] = {"Dim","Lun","Mar","Mer","Jeu","Ven","Sam"};
-    int n    = idleData.forecastDays;
-    int colW = SCR_W / n;  // 320/7 = 45px
-    struct tm tnow; getLocalTime(&tnow, 0);
-    tft.setTextDatum(TC_DATUM);
-    for (int i = 0; i < n; i++) {
-      int cx   = i * colW + colW / 2;
-      int wday = (tnow.tm_wday + i) % 7;
-      // Fond leger pour jour courant
-      if (i == 0) tft.fillRect(i*colW, 150, colW-1, 89, RGB565(14,14,28));
-      // Jour (abrege)
-      tft.setTextColor(i == 0 ? C_ACCENT : C_DIM, C_BG);
-      tft.drawString(dayShort[wday], cx, 154, 1);
-      // Temperature max en grand, min en petit dessous
-      char tb[8];
-      snprintf(tb, sizeof(tb), "%.0f", idleData.forecast[i].tMax);
-      tft.setTextColor(C_TEXT, C_BG);
-      tft.drawString(tb, cx, 164, 2);
-      snprintf(tb, sizeof(tb), "%.0f", idleData.forecast[i].tMin);
-      tft.setTextColor(C_DIM, C_BG);
-      tft.drawString(tb, cx, 182, 1);
-      // Petit separateur vertical entre colonnes
-      if (i > 0) tft.fillRect(i*colW-1, 150, 1, 89, RGB565(22,22,36));
-    }
-  } else {
-    tft.setTextDatum(TC_DATUM); tft.setTextColor(C_DIM, C_BG);
-    tft.drawString("Previsions en attente...", SCR_W/2, 190, 1);
+  if (!pcsFresh()) {
+    tft.fillRect(0, 36, SCR_W, 190, C_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_DIM, C_BG);
+    tft.drawString("Pas de donnees du PC", SCR_W / 2, 120, 2);
+    return;
   }
-  // Hint retour
-  tft.setTextDatum(BC_DATUM);
-  tft.setTextColor(RGB565(45,45,65), C_BG);
-  tft.drawString("< tap pour revenir", SCR_W/2, 239, 1);
+  char b[40];
+  snprintf(b, sizeof(b), "%u %%", pcs.cpu);
+  pcRow(38, "CPU", String(b));                       pcBar(57, pcs.cpu);
+  snprintf(b, sizeof(b), "%.1f / %.1f Go", pcs.ramUsed, pcs.ramTotal);
+  pcRow(76, "Memoire", String(b));                   pcBar(95, pcs.ram);
+  snprintf(b, sizeof(b), "%.0f Go libres", pcs.diskFree);
+  pcRow(114, "Disque", String(b));                   pcBar(133, pcs.disk);
+  pcRow(154, "Reseau", "v " + fmtRate(pcs.down) + "   ^ " + fmtRate(pcs.up));
+  uint32_t m = pcs.uptimeMin;
+  if (m >= 1440) snprintf(b, sizeof(b), "%u j %u h", (unsigned)(m / 1440), (unsigned)((m % 1440) / 60));
+  else           snprintf(b, sizeof(b), "%u h %02u", (unsigned)(m / 60), (unsigned)(m % 60));
+  pcRow(180, "Allume depuis", String(b));
 }
 
-// ----------------------------- Ecran news plein format ---------------------
+// ============================================================================
+//  Pages detail v1.7 : prevision semaine + actualites
+//  Dessin "one-shot" a l'entree de la page (jamais dans loop) : un seul
+//  tft.fillScreen() au changement de page, puis rien ne bouge.
+//  Aucune String : uniquement des char[] sur la pile.
+// ============================================================================
 
-void drawIdleNewsFull() {
-  tft.fillScreen(C_BG);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(C_ACCENT, C_BG);
-  tft.drawString("ACTUALITES", SCR_W/2, 6, 4);
-  tft.fillRect(0, 34, SCR_W, 1, C_TRACK);
+// Tronque 'in' pour tenir dans maxW pixels avec la police COURANTE de tft ; ajoute "..."
+static void ellipsizeOn(TFT_eSPI& g, const char* in, char* out, size_t cap, int maxW) {
+  strlcpy(out, in, cap - 3);                       // garde la place des 3 points
+  if (g.textWidth(out) <= maxW) return;
+  const int dotsW = g.textWidth("...");
+  size_t n = strlen(out);
+  while (n > 0 && g.textWidth(out) + dotsW > maxW) out[--n] = 0;
+  while (n > 0 && out[n - 1] == ' ') out[--n] = 0;
+  { size_t m = strlen(out); snprintf(out + m, cap - m, "..."); }
+}
 
-  if (idleData.newsCount == 0) {
-    tft.setTextColor(C_DIM, C_BG);
-    tft.drawString("Aucune actualite disponible", SCR_W/2, 120, 2);
+static inline void ellipsize(const char* in, char* out, size_t cap, int maxW) { ellipsizeOn(tft, in, out, cap, maxW); }
+
+// Ecrit "val" + petit rond de degre. align : 0 gauche, 1 centre, 2 droite. Renvoie le x de fin.
+static int drawTemp(int x, int cy, int val, uint16_t fg, uint16_t bg,
+                    int ringR, int ringTh, int ringDy, uint8_t align) {
+  char b[8]; snprintf(b, sizeof(b), "%d", val);
+  const int tw = tft.textWidth(b), total = tw + ringR * 2 + 3;
+  const int x0 = (align == 1) ? x - total / 2 : (align == 2) ? x - total : x;
+  tft.setTextColor(fg, bg);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(b, x0, cy);
+  ui::degreeRing(tft, x0 + tw + 3 + ringR, cy + ringDy, ringR, fg, bg, ringTh);
+  return x0 + total;
+}
+
+// ---- Grille des previsions : 5 colonnes de 58 px ---------------------------
+static const int FC_N = 5, FC_W = 58, FC_GAP = 4, FC_Y = 118, FC_H = 110;
+static inline int fcCount()        { return idleData.forecastDays < FC_N ? idleData.forecastDays : FC_N; }
+static inline int fcX0(int n)      { return (SCR_W - (n * FC_W + (n - 1) * FC_GAP)) / 2; }
+
+int fcHit(int x, int y) {
+  const int n = fcCount();
+  if (n <= 0 || y < FC_Y || y > FC_Y + FC_H) return -1;
+  const int rel = x - fcX0(n);
+  if (rel < 0) return -1;
+  const int i = rel / (FC_W + FC_GAP);
+  return i < n ? i : -1;
+}
+
+void drawForecastScreen() {
+  static const char* const DAY3[7] = {"DIM", "LUN", "MAR", "MER", "JEU", "VEN", "SAM"};
+  tft.fillScreen(C_BG);                                    // changement de page uniquement
+
+  // ---- Carte "maintenant" (haut) ----
+  tft.fillRoundRect(10, 6, 300, 106, ui::R_CARD, ui::C_CARD);
+  tft.fillSmoothCircle(24, 22, 3, ui::C_AMBER, ui::C_CARD);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(ui::C_MUTED, ui::C_CARD);
+  char buf[64];
+  ellipsize(idleData.location.length() ? idleData.location.c_str() : "Meteo", buf, sizeof(buf), 140);
+  tft.drawString(buf, 33, 22);
+
+  if (!idleData.hasData) {
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Meteo indisponible", SCR_W / 2, 66);
   } else {
-    int y = 40;
-    for (int i = 0; i < idleData.newsCount && y < SCR_H - 18; i++) {
-      // Numero
-      char num[4]; snprintf(num, sizeof(num), "%d.", i+1);
-      tft.setTextDatum(TL_DATUM);
-      tft.setTextColor(C_ACCENT, C_BG);
-      tft.drawString(num, 4, y, 2);
-      // Titre (tronque si trop long)
-      tft.setTextColor(C_TEXT, C_BG);
-      tft.drawString(fitText(idleData.news[i], 2, SCR_W - 26), 24, y, 2);
-      y += 20;
-      tft.fillRect(0, y-3, SCR_W, 1, RGB565(28,28,40));
+    // Grosse temperature a gauche
+    tft.setFreeFont(&FreeSansBold24pt7b);
+    drawTemp(22, 57, (int)lroundf(idleData.temp), C_TEXT, ui::C_CARD, 5, 2, -13, 0);
+    // Description sous la temperature
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(ui::C_MUTED, ui::C_CARD);
+    tft.setTextDatum(ML_DATUM);
+    ellipsize(idleData.description.c_str(), buf, sizeof(buf), 150);
+    tft.drawString(buf, 22, 92);
+    // Icone + 3 lignes compactes a droite
+    ui::drawWxIcon(tft, 240, 30, ui::wmoToIcon(idleData.weatherCode), 0.8f, ui::C_CARD);
+    tft.setTextColor(ui::C_MUTED, ui::C_CARD);
+    tft.drawString("Ressenti", 184, 66);
+    tft.drawString("Vent",     184, 83);
+    tft.drawString("Humid.",   184, 100);
+    tft.setTextColor(C_TEXT, ui::C_CARD);
+    tft.setTextDatum(MR_DATUM);
+    drawTemp(298, 66, (int)lroundf(idleData.feelsLike), C_TEXT, ui::C_CARD, 3, 1, -5, 2);
+    snprintf(buf, sizeof(buf), "%d km/h", (int)lroundf(idleData.windSpeed));
+    tft.setTextColor(C_TEXT, ui::C_CARD); tft.setTextDatum(MR_DATUM);
+    tft.drawString(buf, 298, 83);
+    snprintf(buf, sizeof(buf), "%d %%", (int)lroundf(idleData.humidity));
+    tft.drawString(buf, 298, 100);
+  }
+
+  // ---- Grille 5 jours (bas) ----
+  const int n = fcCount();
+  if (n > 0) {
+    struct tm tnow; getLocalTime(&tnow, 0);
+    const int x0 = fcX0(n);
+    for (int i = 0; i < n; i++) {
+      const int x = x0 + i * (FC_W + FC_GAP), cx = x + FC_W / 2;
+      const uint16_t bg = (i == 0) ? ui::C_CARD2 : ui::C_CARD;
+      tft.fillRoundRect(x, FC_Y, FC_W, FC_H, 10, bg);
+      // Nom du jour
+      tft.setFreeFont(&FreeSansBold9pt7b);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(i == 0 ? ui::C_AMBER : ui::C_MUTED, bg);
+      tft.drawString(i == 0 ? "AUJ." : DAY3[(tnow.tm_wday + i) % 7], cx, FC_Y + 15);
+      // Mini icone
+      ui::drawWxIcon(tft, cx, FC_Y + 48, ui::wmoToIcon(idleData.forecast[i].code), 0.72f, bg);
+      // Max (blanc, gras) puis min (gris)
+      tft.setFreeFont(&FreeSansBold12pt7b);
+      drawTemp(cx, FC_Y + 79, (int)lroundf(idleData.forecast[i].tMax), C_TEXT, bg, 3, 1, -8, 1);
+      tft.setFreeFont(&FreeSans9pt7b);
+      drawTemp(cx, FC_Y + 98, (int)lroundf(idleData.forecast[i].tMin), ui::C_MUTED, bg, 2, 1, -5, 1);
+    }
+  } else {
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(ui::C_MUTED, C_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Previsions en attente...", SCR_W / 2, 170);
+  }
+  tft.setTextFont(1);                                      // revient a la police par defaut
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(C_TRACK, C_BG);
+  tft.drawString("Tap: detail    2x tap: retour", SCR_W / 2, 231);
+}
+
+// ----------------------------- Page actualites -----------------------------
+void drawNewsScreen() {
+  tft.fillScreen(C_BG);                                    // remise a zero complete : plus de residus de l'accueil
+
+  // Titre
+  tft.fillRoundRect(10, 10, 3, 18, 1, ui::C_AMBER);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(C_TEXT, C_BG);
+  tft.drawString("Actualites", 20, 19);
+
+  tft.setFreeFont(&FreeSans9pt7b);
+  if (idleData.newsCount == 0) {
+    tft.setTextColor(ui::C_MUTED, C_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Aucune actualite disponible", SCR_W / 2, 120);
+  } else {
+    const int ROW_H = 34, GAP = 4, Y0 = 38, MAXR = 5, TXT_X = 36, TXT_W = 300 - (TXT_X - 10) - 12;
+    const int n = idleData.newsCount < MAXR ? idleData.newsCount : MAXR;
+    char line[112];
+    for (int i = 0; i < n; i++) {
+      const int y = Y0 + i * (ROW_H + GAP);
+      tft.fillRoundRect(10, y, 300, ROW_H, 8, ui::C_CARD);
+      tft.fillRoundRect(18, y + 9, 3, ROW_H - 18, 1, ui::C_AMBER);
+      ellipsize(idleData.news[i].c_str(), line, sizeof(line), TXT_W);
+      tft.setTextColor(C_TEXT, ui::C_CARD);
+      tft.setTextDatum(ML_DATUM);
+      tft.drawString(line, TXT_X, y + ROW_H / 2);
     }
   }
-  tft.setTextDatum(BC_DATUM);
-  tft.setTextColor(RGB565(50,50,70), C_BG);
-  tft.drawString("Tap pour revenir", SCR_W/2, SCR_H-2, 1);
+  tft.setTextFont(1);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(C_TRACK, C_BG);
+  tft.drawString("Tap pour revenir", SCR_W / 2, 231);
 }
 
 // ----------------------------- Menu systeme ----------------------------
@@ -1444,10 +2051,10 @@ void drawMenuScreen() {
   tft.setTextColor(C_TEXT, RGB565(18,18,30));
   tft.drawString("-", 50, 100, 4);
   // Barre luminosite
-  int barFill = map(cfg.brightness, 13, 255, 0, 200);
+  int barFill = map(cfg.briPct, 0, 100, 0, 170);
   tft.fillRect(75, 93, 170, 14, RGB565(25,25,40));
   tft.fillRect(75, 93, barFill, 14, C_ACCENT);
-  char bpct[8]; snprintf(bpct, sizeof(bpct), "%d%%", cfg.brightness * 100 / 255);
+  char bpct[8]; snprintf(bpct, sizeof(bpct), "%d%%", cfg.briPct);
   tft.setTextColor(C_TEXT, C_BG);
   tft.setTextDatum(TC_DATUM);
   tft.drawString(bpct, SCR_W/2, 110, 1);
@@ -1472,35 +2079,90 @@ void drawMenuScreen() {
   tft.drawString("Tap ailleurs pour revenir", SCR_W/2, 238, 1);
 }
 
-// ----------------------------- Detail d'un jour meteo ------------------
-void drawDayDetail(int day) {
-  static const char* dayNames2[] = {"Dimanche","Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi"};
-  tft.fillScreen(C_BG);
-  struct tm tnow; getLocalTime(&tnow, 0);
-  int wday = (tnow.tm_wday + day) % 7;
-  // Header
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(C_ACCENT, C_BG);
-  tft.drawString(day == 0 ? "Aujourd'hui" : dayNames2[wday], SCR_W/2, 6, 2);
-  tft.fillRect(20, 26, SCR_W-40, 1, C_ACCENT);
-  // Temperature max / min
-  char buf[20];
-  tft.setTextColor(C_TEXT, C_BG);
-  snprintf(buf, sizeof(buf), "%.0fC", idleData.forecast[day].tMax);
-  tft.drawString(buf, SCR_W/2 - 40, 40, 6);
-  tft.setTextColor(C_DIM, C_BG);
-  snprintf(buf, sizeof(buf), "%.0fC", idleData.forecast[day].tMin);
-  tft.drawString(buf, SCR_W/2 + 60, 70, 4);
-  // Icone + description
-  drawWeatherIconLarge(SCR_W/2, 130, idleData.forecast[day].code);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(C_TEXT, C_BG);
-  tft.drawString(wmoDesc(idleData.forecast[day].code), SCR_W/2, 166, 2);
-  // Hint
-  tft.setTextDatum(BC_DATUM);
-  tft.setTextColor(RGB565(45,45,65), C_BG);
-  tft.drawString("Tap: retour semaine  2x tap: idle", SCR_W/2, 238, 1);
+// ----------------------------- Detail d'un jour meteo (v1.7) -----------
+static uint16_t lerp565(uint16_t a, uint16_t b, uint8_t t /*0..255*/) {
+  const int ar = (a >> 11) & 31, ag = (a >> 5) & 63, ab = a & 31;
+  const int br = (b >> 11) & 31, bg = (b >> 5) & 63, bb = b & 31;
+  return (uint16_t)((((ar * (255 - t) + br * t) / 255) << 11) |
+                    (((ag * (255 - t) + bg * t) / 255) << 5)  |
+                     ((ab * (255 - t) + bb * t) / 255));
 }
+
+// "Max 14°" : libelle gris + valeur coloree, centre sur cxc
+static void drawLabelTemp(int cxc, int cy, const char* label, int val, uint16_t col) {
+  tft.setFreeFont(&FreeSans9pt7b);
+  const int lw = tft.textWidth(label);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  char b[8]; snprintf(b, sizeof(b), "%d", val);
+  const int total = lw + 8 + tft.textWidth(b) + 9;
+  const int x0 = cxc - total / 2;
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(C_DIM, ui::C_CARD); tft.setTextDatum(ML_DATUM);
+  tft.drawString(label, x0, cy + 2);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  drawTemp(x0 + lw + 8, cy, val, col, ui::C_CARD, 3, 1, -8, 0);
+}
+
+void drawDayDetailScreen(int day) {
+  if (day < 0 || day >= idleData.forecastDays) day = 0;
+  const DayForecast& f = idleData.forecast[day];
+  const uint16_t C_COLD = RGB565(100, 210, 255);              // bleu clair
+  tft.fillScreen(C_BG);                                       // changement de page uniquement
+
+  // Date du jour affiche (aujourd'hui + day)
+  time_t t = time(nullptr) + (time_t)day * 86400;
+  struct tm tm; localtime_r(&t, &tm);
+  char buf[48];
+
+  // Carte centrale 280x200
+  const int CX = 20, CY = 6, CW = 280, CH = 200, MID = CX + CW / 2;
+  tft.fillRoundRect(CX, CY, CW, CH, 10, ui::C_CARD);
+
+  // En-tete : nom du jour + date
+  tft.setFreeFont(&FreeSansBold18pt7b);
+  tft.setTextColor(C_TEXT, ui::C_CARD);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(dayNames[tm.tm_wday], MID, CY + 26);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(C_DIM, ui::C_CARD);
+  snprintf(buf, sizeof(buf), day == 0 ? "Aujourd'hui - %d %s" : "%d %s", tm.tm_mday, monthNames[tm.tm_mon]);
+  tft.drawString(buf, MID, CY + 52);
+
+  // Grande icone + description
+  ui::drawWxIcon(tft, MID, CY + 96, ui::wmoToIcon(f.code), 1.3f, ui::C_CARD);
+  tft.setTextColor(C_DIM, ui::C_CARD);
+  tft.drawString(wmoDesc(f.code).c_str(), MID, CY + 138);
+
+  // Min / Max
+  drawLabelTemp(CX + CW / 4,     CY + 162, "Max", (int)lroundf(f.tMax), ui::C_AMBER);
+  drawLabelTemp(CX + CW * 3 / 4, CY + 162, "Min", (int)lroundf(f.tMin), C_COLD);
+
+  // Barre de plage thermique (echelle = min/max de toute la prevision)
+  float gMin = f.tMin, gMax = f.tMax;
+  for (int i = 0; i < idleData.forecastDays; i++) {
+    if (idleData.forecast[i].tMin < gMin) gMin = idleData.forecast[i].tMin;
+    if (idleData.forecast[i].tMax > gMax) gMax = idleData.forecast[i].tMax;
+  }
+  const float span = (gMax - gMin) < 1.0f ? 1.0f : (gMax - gMin);
+  const int BX = CX + 24, BW = CW - 48, BY = CY + 186;
+  tft.fillRoundRect(BX, BY, BW, 4, 2, C_TRACK);
+  int x1 = BX + (int)((f.tMin - gMin) / span * BW), x2 = BX + (int)((f.tMax - gMin) / span * BW);
+  if (x2 - x1 < 8) x2 = x1 + 8;
+  if (x2 > BX + BW) { x2 = BX + BW; x1 = x2 - 8; }
+  for (int px = x1; px <= x2; px++)
+    tft.drawFastVLine(px, BY, 4, lerp565(C_COLD, ui::C_AMBER, (uint8_t)(255L * (px - x1) / (x2 - x1))));
+  tft.fillSmoothCircle(x1, BY + 2, 3, C_COLD, ui::C_CARD);
+  tft.fillSmoothCircle(x2, BY + 2, 3, ui::C_AMBER, ui::C_CARD);
+
+  // Bouton retour discret
+  tft.fillRoundRect(110, 212, 100, 24, 10, C_BTN);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(C_TEXT, C_BTN);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("< Retour", 160, 224);
+  tft.setTextFont(1);
+}
+
 // ----------------------------- Handler /api/idleconfig --------------------
 void handleGetIdleConfig() {
   JsonDocument d;
@@ -1729,6 +2391,7 @@ void wifiTask() {
     MDNS.end();
     if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
     if (!serverStarted) { server.begin(); serverStarted = true; }
+    if (!vizUdpOn) { vizUdp.begin(VIZ_PORT); vizUdpOn = true; }
     // Configurer NTP maintenant qu'on a le WiFi
     if (!ntpConfigured) {
       configTime(0, 0, "pool.ntp.org", "time.google.com");
@@ -1779,7 +2442,6 @@ void setup() {
   loadSettings();
   loadIdleConfig();
   loadWifi();
-  if (cfg.brightness < 200) { cfg.brightness = 255; saveSettings(); }  // force max
   applyAccent();
 
   tft.init();
@@ -1792,20 +2454,30 @@ void setup() {
   touchSPI.begin(25, 39, 32, 33);          // CLK, MISO, MOSI, CS
   ts.begin(touchSPI);
   ts.setRotation(ROTATION);
+  pinMode(LDR_PIN, INPUT);
+  ledInit();
+  ledPwm(0, 0, 0);
+  if (cfg.sdCache) { sdMount(); touchBus(); }   // carte SD (le bus est partage avec le tactile)
 
   TJpgDec.setJpgScale(1);
   TJpgDec.setCallback(tftOutput);
 
   coverBuf = (uint8_t*)malloc(COVER_MAX_BYTES);
   iconBuf  = (uint8_t*)malloc(ICON_MAX_BYTES);
+  bigBuf   = (uint8_t*)malloc(BIG_MAX_BYTES);    // pochette HD (peut rester nul si la memoire manque)
   titleSpr.createSprite(COL_W, TITLE_H);
   barSpr.createSprite(BAR_W, BAR_H);
   eqSpr.createSprite(100, 72);
+  if (!initModernDashboard()) Serial.println("[ui] RAM insuffisante pour les sprites du dashboard");
+  Serial.printf("[ui] heap libre apres sprites: %u (max bloc %u)\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/nowplaying", HTTP_POST, handleNowPlaying);
   server.on("/api/cover", HTTP_POST, handleCover);
   server.on("/api/icon", HTTP_POST, handleIcon);
+  server.on("/api/coverbig", HTTP_POST, handleBigCover);
+  server.on("/api/pcstats", HTTP_POST, handlePcStats);
+  server.on("/api/sdclear", HTTP_POST, handleSdClear);
   server.on("/api/config", HTTP_GET, sendConfig);
   server.on("/api/config", HTTP_POST, handleConfigPost);
   server.on("/api/status", HTTP_GET, handleStatus);
@@ -1862,6 +2534,9 @@ void loop() {
   if (portalActive) dnsServer.processNextRequest();
   tickNetFetch();
   if (serverStarted) server.handleClient();
+  pollViz();
+  tickLdr();
+  tickLed();
 
   Screen want;
   if (WiFi.status() != WL_CONNECTED) {
@@ -1877,13 +2552,14 @@ void loop() {
   }
 
   // Ne pas ecraser les ecrans detail (meteo/news plein format)
-  bool onDetailScreen = (cur == SCR_IDLE_WX || cur == SCR_IDLE_NEWS || cur == SCR_MENU);
+  bool onDetailScreen = (cur == SCR_IDLE_WX || cur == SCR_IDLE_NEWS || cur == SCR_MENU || cur == SCR_IDLE_PC);
   if (!onDetailScreen && want != cur) {
     cur = want;
     lastClockMin = -1;   // force le redessin de l'heure au changement d'ecran
     fullCover = false;   // quitter le mode fullCover si on change d'ecran
+    vizMode = false; lyricFull = false;
     idleDrawn = false;   // forcer redessin de l'ecran idle
-    if (cur == SCR_PLAY) drawPlayScreen();
+    if (cur == SCR_PLAY) drawMusicScreen();
     else if (cur == SCR_WIFI) drawWaitScreen(true);
     // SCR_WAIT sera dessine par animateIdle()
   }
@@ -1904,9 +2580,14 @@ void loop() {
     renderPlay();
   } else if (cur == SCR_WAIT) {
     handleTouch();   // on garde le touch actif pour reset auto-dim
-    animateIdle();
-  } else if (cur == SCR_IDLE_WX || cur == SCR_IDLE_NEWS || cur == SCR_MENU) {
+    if (cur == SCR_WAIT) animateIdle();   // sinon les sprites de l'accueil se repoussent sur la page actus/meteo
+  } else if (cur == SCR_IDLE_WX || cur == SCR_IDLE_NEWS || cur == SCR_MENU || cur == SCR_IDLE_PC) {
     handleTouch();   // tap = retour idle
+    if (cur == SCR_IDLE_PC) {            // page "Mon PC" : redessin a chaque nouvelle mesure (ou quand elle devient perimee)
+      static bool wasFresh = true;
+      bool f = pcsFresh();
+      if (pcPageDirty || f != wasFresh) { pcPageDirty = false; wasFresh = f; drawIdlePcFull(false); }
+    }
   } else {
     animateWait();
   }
