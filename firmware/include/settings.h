@@ -5,7 +5,7 @@
 #ifdef FW_VERSION
 #undef FW_VERSION
 #endif
-#define FW_VERSION        "1.5.0"
+#define FW_VERSION        "1.6.0"
 
 #ifndef HOSTNAME
 #define HOSTNAME          "nowplaying"   // http://nowplaying.local
@@ -24,4 +24,7 @@
 #endif
 #ifndef ICON_MAX_BYTES
 #define ICON_MAX_BYTES    4096
+#endif
+#ifndef BIG_MAX_BYTES
+#define BIG_MAX_BYTES     20480          // pochette plein ecran 240x240 (envoyee a la demande)
 #endif

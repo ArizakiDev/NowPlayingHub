@@ -34,6 +34,7 @@
 #define LOAD_FONT4
 #define LOAD_FONT6
 #define LOAD_FONT7
+#define LOAD_GFXFF            // polices FreeSans/FreeSansBold (dashboard v1.7)
 
 #define SPI_FREQUENCY       40000000
 #define SPI_READ_FREQUENCY  20000000
