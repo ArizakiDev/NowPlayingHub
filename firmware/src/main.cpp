@@ -35,6 +35,9 @@
 #include "esp_wifi.h"
 #include "config.h"
 #include "settings.h"
+#include "TextLayout.h"   // v1.8 : word-wrap / pagination (pur C++, teste sur PC)
+#include "SysDiag.h"      // v1.8 : diagnostic heap (avant/apres, fragmentation, fuites)
+#include <SPIFFS.h>
 #ifndef WIFI_SSID
 #define WIFI_SSID ""
 #endif
@@ -51,6 +54,10 @@ void buildNewsTicker();
 void drawMenuScreen();
 void drawDayDetailScreen(int day);
 void drawIdlePcFull(bool first);
+void drawNewsDetailScreen(int newsIndex);   // v1.8
+void drawSystemMemoryScreen();              // v1.8
+void drawLyricFull();
+void tickLyricBar(bool force = false);
 
 
 // ----------------------------- Couleurs / layout ---------------------------
@@ -197,7 +204,6 @@ static const int LED_R = 4, LED_G = 16, LED_B = 17;
 TFT_eSPI    tft;
 TFT_eSprite titleSpr(&tft);
 TFT_eSprite barSpr(&tft);
-TFT_eSprite eqSpr(&tft);
 #include "Utf8Ascii.h"         // cleanUTF8() : accents -> ASCII
 #include "ModernDashboard.h"   // v1.7 : ecran de veille moderne (cartes + sprites)
 WebServer   server(80);
@@ -219,12 +225,18 @@ uint8_t *coverBuf = nullptr, *iconBuf = nullptr;
 size_t   coverLen = 0, iconLen = 0;
 String   coverIdStored, iconIdStored;
 
+// v1.8 : suivi des echecs de pochette -> jamais d'ecran noir, jamais de boucle de re-demande infinie
+static String   coverFailId;                 // id de la piste dont le dernier essai a echoue
+static uint8_t  coverFails = 0;              // echecs consecutifs pour cet id
+static uint32_t coverFailMs = 0;             // quand (pour re-essayer apres 30 s)
+static const uint8_t COVER_MAX_FAILS = 3;
+
 String   pendingCmd;           // commande tactile a transmettre au PC
 uint32_t cmdMs = 0;
 int      flashIdx = -1;        // bouton surligne
 uint32_t flashUntil = 0;
 
-enum Screen { SCR_NONE, SCR_WIFI, SCR_WAIT, SCR_PLAY, SCR_IDLE_WX, SCR_IDLE_NEWS, SCR_MENU, SCR_IDLE_PC };
+enum Screen { SCR_NONE, SCR_WIFI, SCR_WAIT, SCR_PLAY, SCR_IDLE_WX, SCR_IDLE_NEWS, SCR_MENU, SCR_IDLE_PC, SCR_SYS };
 Screen cur = SCR_NONE;
 
 bool trackDirty = false, coverDirty = false, stateDirty = false, headerDirty = false;
@@ -237,6 +249,26 @@ bool     portalActive  = false;  // true -> la carte diffuse son propre reseau d
 bool     everConnected = false;
 String   portalNets;             // liste <option> des reseaux 2,4 GHz vus au demarrage du portail
 DNSServer dnsServer;
+
+// v1.8 : memorise le canal + BSSID du dernier AP connu -> au boot on se connecte DIRECTEMENT (sans scan de 2-4 s)
+static bool wifiFastLoad(uint8_t* bssid, int* ch) {
+  prefs.begin("wifi", true);
+  bool ok = prefs.getString("fcSsid", "") == wifiSsid && prefs.getUChar("fcCh", 0) > 0 &&
+            prefs.getBytes("fcBssid", bssid, 6) == 6;
+  if (ok) *ch = prefs.getUChar("fcCh", 0);
+  prefs.end();
+  return ok;
+}
+static void wifiFastSave(int ch, const uint8_t* bssid) {
+  uint8_t old[6] = {0};
+  prefs.begin("wifi", false);
+  bool same = prefs.getString("fcSsid", "") == wifiSsid && prefs.getUChar("fcCh", 0) == ch &&
+              prefs.getBytes("fcBssid", old, 6) == 6 && memcmp(old, bssid, 6) == 0;
+  if (!same) {                                              // n'ecrit en NVS que si ca a change (usure de la flash)
+    prefs.putString("fcSsid", wifiSsid); prefs.putUChar("fcCh", (uint8_t)ch); prefs.putBytes("fcBssid", bssid, 6);
+  }
+  prefs.end();
+}
 
 void loadWifi() {
   prefs.begin("wifi", true);
@@ -254,6 +286,8 @@ int      lastSec = -1;
 uint32_t lastTouchMs = 0;   // pour l'auto-dim
 static int      wxDetailDay   = -1;    // jour selectionne dans meteo plein ecran
 static uint32_t lastDetailTap = 0;     // pour double-tap retour depuis detail
+static int      newsDetailIdx = -1;    // v1.8 : actu ouverte en detail (-1 = on est sur la liste)
+static String   newsDetailTitle;       // titre affiche (pour detecter un changement de donnees)
 int      lastClockMin = -1; // pour le redessin de l'heure dans le header
 
 // ----------------------------- Fullscreen pochette -------------------------
@@ -262,10 +296,24 @@ bool fullCover = false;
 // ----------------------------- v1.6 : modes d'affichage, pochette HD, spectre, stats PC, LED
 bool     vizMode   = false;     // ecran visualiseur de spectre
 bool     lyricFull = false;     // paroles en grand
+static bool     lyricSeen = false;      // v1.8 : des paroles ont ete recues pour cette piste
+static uint8_t  lyricPage = 0;          // page courante (ligne tres longue -> pagination auto)
+static uint32_t lyricPageMs = 0;        // dernier changement de page
+static uint32_t lyricHintUntil = 0;     // "Toucher pour fermer" visible jusqu'a...
 bool     bigDirty  = false;     // pochette plein ecran a redessiner
 uint8_t* bigBuf    = nullptr;   // pochette 240x240
 size_t   bigLen    = 0;
 String   bigIdStored;
+
+// v1.8 : le buffer de pochette HD (20 Ko) n'existe que pendant le plein ecran. Alloue a la demande (avec garde-fou
+// sur le plus grand bloc libre), libere a la sortie : +20 Ko de heap en usage normal.
+static void bigRelease() { if (bigBuf) { free(bigBuf); bigBuf = nullptr; } bigLen = 0; bigIdStored = ""; }
+static bool bigEnsure() {
+  if (bigBuf) return true;
+  if (ESP.getMaxAllocHeap() < (uint32_t)BIG_MAX_BYTES + 10000UL) return false;   // garde 10 Ko pour le WiFi/HTTP
+  bigBuf = (uint8_t*)malloc(BIG_MAX_BYTES);
+  return bigBuf != nullptr;
+}
 static bool gNight = false;     // mode nuit actif (calcule par tickAutoDim)
 
 struct PcStats {
@@ -334,6 +382,8 @@ bool     forcedIdle   = false; // true si on est en idle force par pause prolong
 
 // ----------------------------- Donnees IDLE --------------------------------
 struct DayForecast { float tMax = 0, tMin = 0; int code = 0; };
+struct NewsMeta { String desc, when, src; };   // v1.8 : details d'une actu (resume, heure, source), fournis par l'appli PC
+static const size_t NEWS_DESC_MAX = 320;
 struct IdleInfo {
   float  temp        = 0;
   float  feelsLike   = 0;
@@ -347,6 +397,7 @@ struct IdleInfo {
   String sunset;
   String news[10];
   int    newsCount   = 0;
+  NewsMeta newsMeta[10];             // meme indice que news[]
   bool   hasData     = false;
   DayForecast forecast[7];
   int    forecastDays = 0;
@@ -363,8 +414,8 @@ struct IdleNetConfig {
 
 void loadIdleConfig() {
   prefs.begin("idle", true);
-  idleCfg.lat    = prefs.getFloat("ilat",  50.595f);
-  idleCfg.lon    = prefs.getFloat("ilon",  5.117f);
+  idleCfg.lat     = prefs.getFloat("ilat",  50.8504f);
+  idleCfg.lon     = prefs.getFloat("ilon",  4.3517f);
   idleCfg.loc    = prefs.getString("iloc", "Bruxelles");
   idleCfg.rssUrl = prefs.getString("irss", "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr");
   idleCfg.tz     = prefs.getString("itz",  "CET-1CEST,M3.5.0,M10.5.0/3");
@@ -418,71 +469,97 @@ static String wmoDesc(int code) {
   return "Orage";
 }
 
-void fetchWeatherFromNet() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  char url[320];
-  snprintf(url, sizeof(url),
-    "http://api.open-meteo.com/v1/forecast"
-    "?latitude=%.4f&longitude=%.4f"
-    "&current=temperature_2m,apparent_temperature,weather_code"
-    ",wind_speed_10m,relative_humidity_2m,uv_index"
-    "&daily=sunrise,sunset,temperature_2m_max,temperature_2m_min,weather_code"
-    "&timezone=auto&forecast_days=7",
-    idleCfg.lat, idleCfg.lon);
-  HTTPClient http;
-  http.begin(url);
-  http.setTimeout(8000);
-  int code = http.GET();
-  if (code == 200) {
-    String body = http.getString();
-    JsonDocument doc;
-    if (!deserializeJson(doc, body)) {
-      JsonObject wxCur = doc["current"].as<JsonObject>();
-      idleData.temp        = wxCur["temperature_2m"]      | 0.0f;
-      idleData.feelsLike   = wxCur["apparent_temperature"]| 0.0f;
-      idleData.weatherCode = wxCur["weather_code"]        | 0;
-      idleData.windSpeed   = wxCur["wind_speed_10m"]      | 0.0f;
-      idleData.humidity    = wxCur["relative_humidity_2m"]| 0.0f;
-      idleData.uvIndex     = wxCur["uv_index"]            | -1.0f;
-      idleData.description = wmoDesc(idleData.weatherCode);
-      idleData.location    = idleCfg.loc;
-      String sr = doc["daily"]["sunrise"][0] | "";
-      String ss = doc["daily"]["sunset"][0]  | "";
-      idleData.sunrise = (sr.length() >= 16) ? sr.substring(11, 16) : sr;
-      idleData.sunset  = (ss.length() >= 16) ? ss.substring(11, 16) : ss;
-      // Previsions 7 jours
-      idleData.forecastDays = 0;
-      JsonArray tMaxArr  = doc["daily"]["temperature_2m_max"];
-      JsonArray tMinArr  = doc["daily"]["temperature_2m_min"];
-      JsonArray wdCodes  = doc["daily"]["weather_code"];
-      for (int i = 0; i < 7 && i < (int)tMaxArr.size(); i++) {
-        idleData.forecast[i].tMax = tMaxArr[i] | 0.0f;
-        idleData.forecast[i].tMin = tMinArr[i] | 0.0f;
-        idleData.forecast[i].code = wdCodes[i]  | 0;
-        idleData.forecastDays++;
+// ----------------------------- Meteo en tache de fond (v1.8) -----------------
+// La requete HTTP (DNS + connexion + GET) figeait l'ecran ET le tactile pendant 1 a 8 s. Elle tourne maintenant sur le
+// coeur 0 ; le resultat est copie dans idleData par la boucle principale (applyWx) : aucun acces concurrent aux String.
+struct WxRes {
+  float temp, feels, wind, hum, uv; int code;
+  char  sr[8], ss[8];
+  int   days; float tMax[7], tMin[7]; int dCode[7];
+};
+static WxRes wxRes;
+static volatile bool wxReady = false, wxBusy = false;
+static float wxLat = 0, wxLon = 0;
+
+static void wxTask(void*) {
+  {
+    char url[320];
+    snprintf(url, sizeof(url),
+      "http://api.open-meteo.com/v1/forecast"
+      "?latitude=%.4f&longitude=%.4f"
+      "&current=temperature_2m,apparent_temperature,weather_code"
+      ",wind_speed_10m,relative_humidity_2m,uv_index"
+      "&daily=sunrise,sunset,temperature_2m_max,temperature_2m_min,weather_code"
+      "&timezone=auto&forecast_days=7", wxLat, wxLon);
+    HTTPClient http;
+    http.begin(url);
+    http.setConnectTimeout(3000);
+    http.setTimeout(4000);
+    const int code = http.GET();
+    if (code == 200) {
+      String body = http.getString();
+      JsonDocument doc;
+      if (!deserializeJson(doc, body)) {
+        WxRes w; memset(&w, 0, sizeof(w));
+        JsonObject c = doc["current"].as<JsonObject>();
+        w.temp  = c["temperature_2m"]       | 0.0f;
+        w.feels = c["apparent_temperature"] | 0.0f;
+        w.code  = c["weather_code"]         | 0;
+        w.wind  = c["wind_speed_10m"]       | 0.0f;
+        w.hum   = c["relative_humidity_2m"] | 0.0f;
+        w.uv    = c["uv_index"]             | -1.0f;
+        const char* sr = doc["daily"]["sunrise"][0] | "";
+        const char* ss = doc["daily"]["sunset"][0]  | "";
+        if (strlen(sr) >= 16) { memcpy(w.sr, sr + 11, 5); w.sr[5] = 0; }
+        if (strlen(ss) >= 16) { memcpy(w.ss, ss + 11, 5); w.ss[5] = 0; }
+        JsonArray tMax = doc["daily"]["temperature_2m_max"];
+        JsonArray tMin = doc["daily"]["temperature_2m_min"];
+        JsonArray wc   = doc["daily"]["weather_code"];
+        for (int i = 0; i < 7 && i < (int)tMax.size(); i++) {
+          w.tMax[i] = tMax[i] | 0.0f; w.tMin[i] = tMin[i] | 0.0f; w.dCode[i] = wc[i] | 0; w.days++;
+        }
+        wxRes = w;
+        wxReady = true;
       }
-      idleData.hasData = true;
-      if (::cur == SCR_WAIT) idleDrawn = false;
-      Serial.printf("[wx-esp] %.1fC code=%d\n", idleData.temp, idleData.weatherCode);
+    } else {
+      Serial.printf("[wx-esp] HTTP %d\n", code);
     }
-  } else { Serial.printf("[wx-esp] HTTP %d\n", code); }
-  http.end();
+    http.end();
+  }
+  wxBusy = false;
+  vTaskDelete(NULL);
 }
 
-// RSS fetch desactive cote ESP32 (fait par la PC App via /api/idle)
-// Les news arrivent via handleIdle() depuis NowPlayingHub.exe
-// RSS: fourni par PC App via /api/idle
-void fetchRssFromNet() { /* no-op */ }
+void fetchWeatherFromNet() {
+  if (wxBusy || WiFi.status() != WL_CONNECTED) return;
+  wxBusy = true; wxLat = idleCfg.lat; wxLon = idleCfg.lon;
+  if (xTaskCreatePinnedToCore(wxTask, "wx", 8192, nullptr, 1, nullptr, 0) != pdPASS) wxBusy = false;
+}
+
+// Appelee par la boucle principale : recopie le resultat de la tache dans idleData
+static void applyWx() {
+  if (!wxReady) return;
+  wxReady = false;
+  idleData.temp = wxRes.temp; idleData.feelsLike = wxRes.feels; idleData.weatherCode = wxRes.code;
+  idleData.windSpeed = wxRes.wind; idleData.humidity = wxRes.hum; idleData.uvIndex = wxRes.uv;
+  idleData.description = wmoDesc(wxRes.code);
+  idleData.location    = idleCfg.loc;
+  idleData.sunrise = wxRes.sr; idleData.sunset = wxRes.ss;
+  idleData.forecastDays = 0;
+  for (int i = 0; i < wxRes.days && i < 7; i++) {
+    idleData.forecast[i].tMax = wxRes.tMax[i]; idleData.forecast[i].tMin = wxRes.tMin[i]; idleData.forecast[i].code = wxRes.dCode[i];
+    idleData.forecastDays++;
+  }
+  idleData.hasData = true;
+  if (::cur == SCR_WAIT) idleDrawn = false;
+  Serial.printf("[wx-esp] %.1fC code=%d\n", idleData.temp, idleData.weatherCode);
+}
 
 void tickNetFetch() {
+  applyWx();
   if (WiFi.status() != WL_CONNECTED) return;
-  uint32_t now = millis();
-  if (!firstFetchDone) {
-    firstFetchDone = true;
-    fetchWeatherFromNet();
-    lastWxFetch = now;
-    return;
-  }
+  const uint32_t now = millis();
+  if (!firstFetchDone) { firstFetchDone = true; fetchWeatherFromNet(); lastWxFetch = now; return; }
   if (now - lastWxFetch >= 900000UL) { lastWxFetch = now; fetchWeatherFromNet(); }
 }
 
@@ -577,12 +654,26 @@ bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   return true;
 }
 
-// Decode le corps "plain" (base64) d'une requete dans buf ; verifie la signature JPEG
-bool decodeJpegBody(uint8_t* buf, size_t cap, size_t& outLen) {
-  String b64 = server.arg("plain");
+// Decode le corps "plain" (base64) d'une requete dans buf ; verifie la signature JPEG (SOI) ET la fin (EOI).
+// v1.8 : on verifie la taille AVANT d'ecrire (un decodage partiel ne corrompt plus le buffer) et on
+// detecte un corps vide (= allocation du POST refusee par un heap morcele, ou timeout reseau).
+bool decodeJpegBody(uint8_t* buf, size_t cap, size_t& outLen, const char* tag = "img") {
+  outLen = 0;
+  if (!buf) { Serial.printf("[%s] buffer non alloue\n", tag); return false; }
+  const String& b64 = server.arg("plain");                  // reference : pas de copie supplementaire si la lib renvoie const&
+  const size_t n64 = b64.length();
+  if (n64 < 8) { Serial.printf("[%s] corps vide/tronque (len=%u) : RAM ou timeout reseau ?\n", tag, (unsigned)n64); return false; }
+  const size_t est = (n64 / 4) * 3;                         // taille decodee (au plus)
+  if (est > cap + 3) { Serial.printf("[%s] trop gros : ~%u o > %u o\n", tag, (unsigned)est, (unsigned)cap); return false; }
   size_t o = 0;
-  int rc = mbedtls_base64_decode(buf, cap, &o, (const uint8_t*)b64.c_str(), b64.length());
-  if (rc != 0 || o < 4 || buf[0] != 0xFF || buf[1] != 0xD8) { outLen = 0; return false; }
+  int rc = mbedtls_base64_decode(buf, cap, &o, (const uint8_t*)b64.c_str(), n64);
+  if (rc != 0 || o < 4 || buf[0] != 0xFF || buf[1] != 0xD8) {
+    Serial.printf("[%s] base64/SOI invalide rc=%d o=%u\n", tag, rc, (unsigned)o);
+    return false;
+  }
+  bool eoi = false;                                          // marqueur de fin FFD9 dans les derniers octets
+  for (size_t i = o >= 8 ? o - 8 : 0; i + 1 < o; i++) if (buf[i] == 0xFF && buf[i + 1] == 0xD9) { eoi = true; break; }
+  if (!eoi) { Serial.printf("[%s] JPEG tronque (pas de EOI), %u o\n", tag, (unsigned)o); return false; }
   outLen = o;
   return true;
 }
@@ -595,12 +686,27 @@ static const int SD_CS = 5, SD_SCK = 18, SD_MISO = 19, SD_MOSI = 23;
 static SPIClass sdSPI(VSPI);
 static bool     sdOk = false, sdBusDirty = false;
 static uint32_t sdCount = 0;
+static bool     sdCounted = false;     // v1.8 : le comptage des fichiers n'est fait qu'au premier besoin (pas au boot)
 static uint32_t sdSizeMB = 0;
 static const char* SD_DIR_S = "/np_s";    // petites pochettes (120x120)
 static const char* SD_DIR_B = "/np_b";    // grandes pochettes (240x240)
 
-static void sdBus()    { sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS); sdBusDirty = true; }
-static void touchBus() { if (sdBusDirty) { touchSPI.begin(25, 39, 32, 33); sdBusDirty = false; } }
+// v1.8 : SPIClass::begin() ne fait RIEN si l'objet est deja demarre (retour immediat) : l'ancien code ne
+// rebranchait donc jamais les broches (MISO 39 tactile <-> MISO 19 SD) apres le premier acces a la carte.
+// On fait maintenant end() + begin() au CHANGEMENT de proprietaire uniquement (pas a chaque lecture).
+static uint8_t busOwner = 0;    // 0 = tactile, 1 = carte SD
+static void sdBus() {
+  if (busOwner == 1) return;
+  sdSPI.end();
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  busOwner = 1; sdBusDirty = true;
+}
+static void touchBus() {
+  if (busOwner == 0) return;
+  touchSPI.end();
+  touchSPI.begin(25, 39, 32, 33);
+  busOwner = 0; sdBusDirty = false;
+}
 
 static void sdMount() {
   sdOk = false;
@@ -613,7 +719,14 @@ static void sdMount() {
   sdSizeMB = (uint32_t)(SD.cardSize() / (1024ULL * 1024ULL));
   SD.mkdir(SD_DIR_S);
   SD.mkdir(SD_DIR_B);
-  sdCount = 0;
+  sdCount = 0; sdCounted = false;
+  Serial.printf("[sd] carte OK : %u Mo\n", (unsigned)sdSizeMB);
+}
+
+// Compte les fichiers du cache une seule fois, a la premiere ecriture
+static void sdEnsureCount() {
+  if (sdCounted || !sdOk) return;
+  sdCounted = true; sdCount = 0;
   const char* dirs[2] = { SD_DIR_S, SD_DIR_B };
   for (int k = 0; k < 2; k++) {
     File d = SD.open(dirs[k]);
@@ -622,7 +735,6 @@ static void sdMount() {
     while (f) { sdCount++; f.close(); f = d.openNextFile(); }
     d.close();
   }
-  Serial.printf("[sd] carte OK : %u Mo, %u fichiers en cache\n", (unsigned)sdSizeMB, (unsigned)sdCount);
 }
 
 static String sdName(const char* dir, const String& id) {
@@ -676,6 +788,7 @@ static void sdSave(const char* dir, const String& id, const uint8_t* buf, size_t
   String p = sdName(dir, id);
   if (!p.length()) return;
   sdBus();
+  sdEnsureCount();
   if (SD.exists(p)) return;
   File f = SD.open(p, FILE_WRITE);
   if (!f) return;
@@ -705,6 +818,25 @@ static void sdClear() {
     for (int i = 0; i < got; i++) SD.remove(victims[i]);
   }
   sdCount = 0;
+}
+
+// Supprime une pochette du cache (fichier illisible) pour ne pas la re-servir en boucle
+static void sdDrop(const char* dir, const String& id) {
+  if (!sdOk || !cfg.sdCache) return;
+  String p = sdName(dir, id);
+  if (!p.length()) return;
+  sdBus();
+  if (SD.exists(p) && SD.remove(p) && sdCount) sdCount--;
+}
+
+// Enregistre un echec de pochette (reception ou decodage). Apres COVER_MAX_FAILS echecs sur la meme piste,
+// on cesse de la redemander pendant 30 s et on affiche le placeholder (voir handleNowPlaying).
+static void registerCoverFail(const String& id, const char* why) {
+  if (id != coverFailId) { coverFailId = id; coverFails = 0; }
+  if (coverFails < 255) coverFails++;
+  coverFailMs = millis();
+  Serial.printf("[cover] ECHEC %u/%u (%s) id=%s | free=%u maxBlk=%u\n", (unsigned)coverFails, (unsigned)COVER_MAX_FAILS,
+                why, id.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 }
 
 
@@ -982,36 +1114,67 @@ void drawButtons(int hi = -1) {
   }
 }
 
+// ----------------------------- Pochette : repli + dessin securise (v1.8) -----------
+// Placeholder elegant : carre #2C2C2E + note de musique vectorielle (2 croches liees), a l'echelle sz.
+void drawCoverPlaceholder(int x, int y, int sz) {
+  tft.fillRoundRect(x, y, sz, sz, 10, C_BTN);
+  const float k  = sz / 120.0f;                                  // 1.0 = pochette 120 px
+  const int   cx = x + sz / 2, cy = y + sz / 2;
+  const int   r  = (int)(11 * k + 0.5f);                         // rayon des tetes
+  const int   sw = max(3, (int)(4 * k + 0.5f));                  // epaisseur des hampes
+  const int   lx = cx - (int)(20 * k), ly = cy + (int)(22 * k);  // tete gauche
+  const int   rx = cx + (int)(18 * k), ry = cy + (int)(14 * k);  // tete droite (plus haute)
+  const int   tl = cy - (int)(30 * k), tr = cy - (int)(38 * k);  // sommets des hampes
+  tft.fillRect(lx + r - sw, tl, sw, ly - tl, C_DIM);             // hampes
+  tft.fillRect(rx + r - sw, tr, sw, ry - tr, C_DIM);
+  tft.drawWideLine(lx + r - sw, tl + 3 * k, rx + r, tr + 3 * k, 8 * k, C_DIM, C_BTN);   // barre oblique
+  tft.fillSmoothCircle(lx, ly, r, C_DIM, C_BTN);                 // tetes
+  tft.fillSmoothCircle(rx, ry, r, C_DIM, C_BTN);
+}
+
+// Dessine un JPEG de pochette apres VALIDATION de son en-tete (dimensions plausibles, decodeur OK).
+// Retourne false si illisible : l'appelant dessine alors le placeholder (qui recouvre un eventuel dessin partiel).
+// Le code de retour TJpgDec est loggue en clair (MEM1 = workspace trop petit, FMT3 = JPEG progressif...).
+static bool drawJpegSafe(int x, int y, const uint8_t* buf, size_t len, int maxDim, const char* tag) {
+  if (!buf || len < 4) return false;
+  uint16_t w = 0, h = 0;
+  JRESULT r = TJpgDec.getJpgSize(&w, &h, buf, (uint32_t)len);
+  if (r != JDR_OK || w == 0 || h == 0 || w > maxDim || h > maxDim) {
+    Serial.printf("[%s] en-tete JPEG refuse : %s (%ux%u, %u o)\n", tag, diag::jpegErr((int)r), (unsigned)w, (unsigned)h, (unsigned)len);
+    return false;
+  }
+  diag::HeapScope hs(tag);                                       // heap avant/apres le decodage
+  r = TJpgDec.drawJpg(x, y, buf, (uint32_t)len);
+  if (r != JDR_OK) {
+    Serial.printf("[%s] decodage echoue : %s\n", tag, diag::jpegErr((int)r));
+    return false;
+  }
+  return true;
+}
+
 void drawCover() {
-  bool ok = coverLen > 0 && np.coverId.length() && coverIdStored == np.coverId;
-  if (ok) { TJpgDec.drawJpg(COVER_X, COVER_Y, coverBuf, coverLen); return; }
-  tft.fillRoundRect(COVER_X, COVER_Y, COVER_SZ, COVER_SZ, 10, C_PLACE);
-  int cx = COVER_X + COVER_SZ / 2, cy = COVER_Y + COVER_SZ / 2;
-  tft.fillCircle(cx - 10, cy + 22, 12, C_DIM);
-  tft.fillRect(cx + 1, cy - 32, 5, 54, C_DIM);
-  tft.fillTriangle(cx + 6, cy - 32, cx + 28, cy - 20, cx + 6, cy - 8, C_DIM);
+  const bool have = coverLen > 0 && np.coverId.length() && coverIdStored == np.coverId;
+  if (have && drawJpegSafe(COVER_X, COVER_Y, coverBuf, coverLen, 240, "cover-draw")) return;
+  if (have) {                                                    // buffer present mais illisible
+    const String bad = coverIdStored;
+    registerCoverFail(bad, "decodage TJpgDec");                  // compte l'echec (limite les re-envois)
+    sdDrop(SD_DIR_S, bad);                                       // ne pas re-servir un fichier SD corrompu
+    coverLen = 0; coverIdStored = "";
+  }
+  drawCoverPlaceholder(COVER_X, COVER_Y, COVER_SZ);              // JAMAIS d'ecran noir ni de residu de la piste precedente
 }
 
 // Pochette plein ecran : 240x240 (envoyee a la demande par le PC), sinon la petite pochette centree en attendant
 void drawFullCoverScreen() {
   tft.fillScreen(C_BG);
-  bool bigOk = bigBuf && bigLen > 0 && np.coverId.length() && bigIdStored == np.coverId;
+  const bool bigOk = bigBuf && bigLen > 0 && np.coverId.length() && bigIdStored == np.coverId;
   if (bigOk) {
-    TJpgDec.drawJpg((SCR_W - 240) / 2, 0, bigBuf, bigLen);
-    return;
+    if (drawJpegSafe((SCR_W - 240) / 2, 0, bigBuf, bigLen, 240, "big-draw")) return;
+    bigLen = 0; bigIdStored = "";                                // HD illisible : repli sur la petite pochette
   }
-  bool ok = coverLen > 0 && np.coverId.length() && coverIdStored == np.coverId;
-  int cx = (SCR_W - COVER_SZ) / 2;
-  int cy = (SCR_H - COVER_SZ) / 2;
-  if (ok) {
-    TJpgDec.drawJpg(cx, cy, coverBuf, coverLen);
-  } else {
-    tft.fillRoundRect(cx, cy, COVER_SZ, COVER_SZ, 10, C_PLACE);
-    int icx = cx + COVER_SZ / 2, icy = cy + COVER_SZ / 2;
-    tft.fillCircle(icx - 10, icy + 22, 12, C_DIM);
-    tft.fillRect(icx + 1, icy - 32, 5, 54, C_DIM);
-    tft.fillTriangle(icx + 6, icy - 32, icx + 28, icy - 20, icx + 6, icy - 8, C_DIM);
-  }
+  const bool ok = coverLen > 0 && np.coverId.length() && coverIdStored == np.coverId;
+  const int cx = (SCR_W - COVER_SZ) / 2, cy = (SCR_H - COVER_SZ) / 2;
+  if (!(ok && drawJpegSafe(cx, cy, coverBuf, coverLen, 240, "cover-draw"))) drawCoverPlaceholder(cx, cy, COVER_SZ);
   tft.setTextDatum(BC_DATUM);
   tft.setTextColor(RGB565(60, 60, 75), C_BG);
   tft.drawString("Chargement HD...", SCR_W / 2, SCR_H - 4, 2);
@@ -1123,35 +1286,103 @@ void drawLyric() {
   }
 }
 
-// ----------------------------- Paroles plein ecran --------------------------
+// ----------------------------- Paroles plein ecran (v1.8) --------------------
+// Largeur de n caracteres dans la police COURANTE (copie bornee : textWidth() veut une chaine terminee).
+static int tftWidthN(const char* p, int n) {
+  char b[160];
+  if (n > (int)sizeof(b) - 1) n = (int)sizeof(b) - 1;
+  memcpy(b, p, n); b[n] = 0;
+  return tft.textWidth(b);
+}
+// Dessine la tranche [l.start, l.start+l.len) de s en (x, y), avec le datum courant.
+static void drawSlice(const char* s, const txt::Line& l, int x, int y) {
+  char b[160];
+  int n = l.len > (int)sizeof(b) - 1 ? (int)sizeof(b) - 1 : l.len;
+  memcpy(b, s + l.start, n); b[n] = 0;
+  tft.drawString(b, x, y);
+}
+
+// Polices candidates, de la plus grande a la plus petite : la 1re dans laquelle la ligne tient sur UNE page est retenue ;
+// sinon la plus petite + pagination automatique (une page toutes les 2,8 s).
+struct LyFont { const GFXfont* gfx; uint8_t builtin; uint8_t lineH; uint8_t perPage; };
+static const LyFont LY_FONTS[3] = {
+  { &FreeSansBold12pt7b, 0, 28, 3 },
+  { &FreeSansBold9pt7b,  0, 24, 4 },
+  { nullptr,             2, 20, 5 },
+};
+static void applyLyFont(const LyFont& f) { if (f.gfx) tft.setFreeFont(f.gfx); else tft.setTextFont(f.builtin); }
+static uint8_t lyricPages = 1;                       // nombre de pages de la ligne courante (maj par drawLyricFull)
+
+// Zones : en-tete 0-22 | precedente 24-62 | COURANTE 64-172 | points de page 176 | suivante 186-222 | aide 228 | barre 237
 void drawLyricFull() {
   tft.fillScreen(C_BG);
-  tft.setTextDatum(TC_DATUM);
+  const int CX = SCR_W / 2;
+
+  // En-tete : titre - artiste + bouton de fermeture visible (zone tactile = tout l'ecran)
+  tft.setTextFont(1);
+  tft.setTextDatum(MC_DATUM);
   tft.setTextColor(C_DIM, C_BG);
-  tft.drawString(fitText(np.title + " - " + np.artist, 1, SCR_W - 16), SCR_W / 2, 4, 1);
+  tft.drawString(fitText(np.title + " - " + np.artist, 1, SCR_W - 56), CX, 11, 1);
+  tft.fillSmoothCircle(SCR_W - 16, 12, 10, C_BTN, C_BG);
+  tft.drawLine(SCR_W - 20, 8, SCR_W - 12, 16, C_TEXT);
+  tft.drawLine(SCR_W - 20, 16, SCR_W - 12, 8, C_TEXT);
 
-  String l[4];
-  // ligne precedente (en haut, grisee, 2 lignes max, alignee sur le bas de sa zone)
-  int pn = wrapText(np.lyricPrev, 2, SCR_W - 20, 2, l);
-  for (int i = 0; i < pn; i++) tft.drawString(l[i], SCR_W / 2, 56 - (pn - i) * 16, 2);
+  // Ligne precedente : police 2, grisee, alignee sur le bas de sa zone
+  txt::Line ln[16];
+  bool trunc = false;
+  tft.setTextFont(2);
+  tft.setTextColor(RGB565(99, 99, 102), C_BG);
+  int pn = txt::wrap(np.lyricPrev.c_str(), SCR_W - 24, tftWidthN, ln, 2, &trunc);
+  for (int i = 0; i < pn; i++) drawSlice(np.lyricPrev.c_str(), ln[i], CX, 62 - (pn - i) * 18 + 9);
 
-  // ligne en cours (grande, 4 lignes max, centree verticalement)
+  // Ligne courante : plus grande police dans laquelle elle tient
+  const char* curLine = np.lyric.length() ? np.lyric.c_str() : (lyricSeen ? "..." : "Pas de paroles");
+  int total = 0, fi = 0;
+  for (fi = 0; fi < 3; fi++) {
+    applyLyFont(LY_FONTS[fi]);
+    total = txt::wrap(curLine, SCR_W - 24, tftWidthN, ln, 16, &trunc);
+    if (total <= LY_FONTS[fi].perPage && !trunc) break;
+  }
+  if (fi == 3) fi = 2;                                           // ne tient pas : plus petite police + pages
+  const LyFont& F = LY_FONTS[fi];
+  lyricPages = (uint8_t)txt::pageCount(total, F.perPage);
+  if (lyricPage >= lyricPages) lyricPage = 0;
+  const int first = lyricPage * F.perPage;
+  const int cnt   = (total - first) < F.perPage ? (total - first) : F.perPage;
   tft.setTextColor(C_TEXT, C_BG);
-  int n = wrapText(np.lyric.length() ? np.lyric : String("..."), 4, SCR_W - 16, 4, l);
-  int y0 = 62 + (112 - n * 26) / 2;
-  for (int i = 0; i < n; i++) tft.drawString(l[i], SCR_W / 2, y0 + i * 26, 4);
+  tft.setTextDatum(MC_DATUM);
+  const int y0 = 64 + (108 - cnt * F.lineH) / 2 + F.lineH / 2;   // bloc centre verticalement dans 64..172
+  for (int i = 0; i < cnt; i++) drawSlice(curLine, ln[first + i], CX, y0 + i * F.lineH);
 
-  // ligne suivante (en bas, grisee)
+  // Points de pagination
+  if (lyricPages > 1) {
+    const int gap = 12, x0 = CX - (lyricPages - 1) * gap / 2;
+    for (int p = 0; p < lyricPages; p++)
+      tft.fillSmoothCircle(x0 + p * gap, 178, p == lyricPage ? 3 : 2, p == lyricPage ? C_ACCENT : C_TRACK, C_BG);
+  }
+
+  // Ligne suivante : police 2, grisee
+  tft.setTextFont(2);
   tft.setTextColor(C_DIM, C_BG);
-  int nn = wrapText(np.lyricNext, 2, SCR_W - 20, 2, l);
-  for (int i = 0; i < nn; i++) tft.drawString(l[i], SCR_W / 2, 182 + i * 16, 2);
+  int nn = txt::wrap(np.lyricNext.c_str(), SCR_W - 24, tftWidthN, ln, 2, &trunc);
+  for (int i = 0; i < nn; i++) drawSlice(np.lyricNext.c_str(), ln[i], CX, 186 + i * 18 + 9);
+
+  // Aide a la fermeture, 3 s apres l'ouverture
+  if (millis() < lyricHintUntil) {
+    tft.setTextFont(1);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(C_TRACK, C_BG);
+    tft.drawString("Toucher pour fermer", CX, 228, 1);
+  }
+  tft.setTextFont(1);
+  tickLyricBar(true);
 }
 
 // fine barre de progression en bas de l'ecran des paroles
-void tickLyricBar() {
+void tickLyricBar(bool force) {
   static int lastS = -1;
   int s = (int)curPos();
-  if (s == lastS) return;
+  if (!force && s == lastS) return;
   lastS = s;
   const int y = SCR_H - 3;
   tft.fillRect(0, y, SCR_W, 3, C_TRACK);
@@ -1160,11 +1391,20 @@ void tickLyricBar() {
 
 void renderLyricFull() {
   if (trackDirty) { trackDirty = false; coverDirty = false; lyricDirty = true; }   // nouveau titre : tout redessiner
-  if (lyricDirty) { lyricDirty = false; drawLyricFull(); }
+  if (lyricDirty) {
+    lyricDirty = false; lyricPage = 0; lyricPageMs = millis();
+    drawLyricFull();
+  } else if (lyricPages > 1 && millis() - lyricPageMs > 2800) {                    // pagination automatique
+    lyricPage = (uint8_t)((lyricPage + 1) % lyricPages); lyricPageMs = millis();
+    drawLyricFull();
+  }
+  if (lyricHintUntil && millis() > lyricHintUntil) {                               // l'aide disparait
+    lyricHintUntil = 0;
+    tft.fillRect(0, 226, SCR_W, 11, C_BG);
+  }
   tickLyricBar();
 }
 
-// ----------------------------- Visualiseur de spectre -----------------------
 static const int VZ_X0 = 10, VZ_W = 300, VZ_BASE = 214, VZ_H = 160;
 static int      vzH[VIZ_MAX], vzPeak[VIZ_MAX];
 static uint32_t vzPeakMs[VIZ_MAX];
@@ -1297,12 +1537,16 @@ void animateWait() {
   static uint32_t t = 0;
   if (millis() - t < 80) return;
   t = millis();
-  eqSpr.fillSprite(C_BG);
+  // v1.8 : dessin direct (le sprite 100x72 coutait 14 Ko de RAM). On n'efface que la partie retiree de chaque barre
+  // -> pas de scintillement.
+  static int prevH[5] = { 0, 0, 0, 0, 0 };
   for (int i = 0; i < 5; i++) {
-    int h = 10 + (int)(24 + 24 * sinf(millis() / 260.0f + i * 1.3f));
-    eqSpr.fillRoundRect(6 + i * 20, 70 - h, 10, h, 3, C_ACCENT);
+    const int h  = 10 + (int)(24 + 24 * sinf(millis() / 260.0f + i * 1.3f));
+    const int x  = 110 + 6 + i * 20, yb = 30 + 70;
+    if (h < prevH[i]) tft.fillRect(x, yb - prevH[i], 10, prevH[i] - h + 1, C_BG);
+    tft.fillRoundRect(x, yb - h, 10, h, 3, C_ACCENT);
+    prevH[i] = h;
   }
-  eqSpr.pushSprite(110, 30);
   // Mise a jour de l'horloge sur l'ecran d'attente chaque minute
   struct tm tm;
   if (getLocalTime(&tm, 0)) {
@@ -1364,12 +1608,25 @@ void pressButton(int i) {
   drawButtons(i);
 }
 
+// ---- Zones tactiles (v1.8) : GENEREUSES et CONTIGUES (plus de trous entre les boutons) ----
+// Bande des boutons = 14 px au-dessus / 2 px sous le bouton ; colonnes = zone la plus proche du centre de chaque bouton.
+static const int HIT_BTN_Y0  = BTN_Y - 16, HIT_BTN_Y1 = BTN_Y + BTN_H + 2;   // 114..168
+static const int HIT_SEEK_Y0 = HIT_BTN_Y1 + 1, HIT_SEEK_Y1 = BAR_Y + 32;    // 169..198 (barre de progression + temps)
+static const int HIT_LYR_Y0  = HIT_SEEK_Y1 + 1;                               // 199..239 (paroles)
+
+// Retourne 0 (prev), 1 (play/pause), 2 (next) ou -1
+static int playButtonHit(int x, int y) {
+  if (y < HIT_BTN_Y0 || y > HIT_BTN_Y1 || x < COL_X - 10) return -1;
+  int i = (x - COL_X + (BTN_STEP - BTN_W) / 2) / BTN_STEP;
+  return constrain(i, 0, 2);
+}
+
 // Fin d'un toucher sur l'ecran lecture : sortie des modes plein ecran, balayage, ou tap sur une zone
 static void onPlayRelease(int sx, int sy, int ex, int ey) {
   int dx = ex - sx, dy = ey - sy;
-  if (fullCover) { fullCover = false; drawMusicScreen(); return; }
+  if (fullCover) { fullCover = false; bigRelease(); drawMusicScreen(); return; }
   if (vizMode)   { vizMode   = false; drawMusicScreen(); return; }
-  if (lyricFull) { lyricFull = false; drawMusicScreen(); return; }
+  if (lyricFull) { lyricFull = false; lyricHintUntil = 0; drawMusicScreen(); return; }   // tap n'importe ou (ou balayage) = fermer
   if (abs(dx) > 40 && abs(dx) > abs(dy)) {                  // balayage : droite = prev, gauche = next
     pressButton(dx > 0 ? 0 : 2);
     return;
@@ -1381,11 +1638,11 @@ static void onPlayRelease(int sx, int sy, int ex, int ey) {
     fullCover = true; drawFullCoverScreen(); return;
   }
   // Tap sur le bloc artiste / album -> visualiseur de spectre
-  if (sx >= COL_X && sy >= ARTIST_Y - 6 && sy < BTN_Y - 6) {
+  if (sx >= COL_X && sy >= ARTIST_Y - 6 && sy < HIT_BTN_Y0) {
     vizMode = true; drawVizScreen(); return;
   }
   // Tap sur la barre de progression -> se deplacer dans le morceau
-  if (sy >= BAR_Y + 2 && sy <= BAR_Y + 26 && np.duration > 0) {
+  if (sy >= HIT_SEEK_Y0 && sy <= HIT_SEEK_Y1 && np.duration > 0) {
     float frac = constrain((float)(ex - BAR_X) / (float)BAR_W, 0.0f, 1.0f);
     float secs = frac * np.duration;
     pendingCmd = "seek:" + String(secs, 1);
@@ -1394,36 +1651,57 @@ static void onPlayRelease(int sx, int sy, int ex, int ey) {
     tickBar(true);
     return;
   }
-  // Tap sur les paroles -> paroles en grand
-  if (sy >= BAR_Y + 34 && (np.lyric.length() || np.lyricPrev.length() || np.lyricNext.length())) {
-    lyricFull = true; lyricDirty = false; drawLyricFull(); return;
+  // Tap sur la zone des paroles (tout le bas de l'ecran) -> paroles plein ecran
+  if (sy >= HIT_LYR_Y0 && (lyricSeen || np.lyric.length() || np.lyricPrev.length() || np.lyricNext.length())) {
+    lyricFull = true; lyricDirty = false;
+    lyricPage = 0; lyricPageMs = millis(); lyricHintUntil = millis() + 3000;
+    drawLyricFull();
+    return;
   }
 }
 
+// ---- Actualites : zone tactile d'une ligne de la liste (-1 si aucune). Lignes de 34 px + 4 px d'ecart, grise de 3 px. ----
+static const int NEWS_HEAD_H = 34, NEWS_Y0 = 38, NEWS_PITCH = 38;
+static int newsRowHit(int x, int y) {
+  (void)x;
+  const int n = idleData.newsCount < 5 ? idleData.newsCount : 5;
+  const int top = NEWS_Y0 - 3;
+  if (y < top || y >= top + n * NEWS_PITCH) return -1;
+  return (y - top) / NEWS_PITCH;
+}
+
+// ---- Ecran Systeme : tap = page suivante, puis retour au menu ----
+void sysScreenTap();      // defini avec l'ecran Systeme
+
 void handleTouch() {
   static bool     down   = false;
-  static uint32_t last   = 0;
+  static uint32_t lastRelease = 0;  // v1.8 : anti-rebond sur le RELACHEMENT (40 ms) - l'ancien verrou de 250 ms sur l'APPUI avalait les taps rapides
   static int      startX = -1, startY = -1;   // debut du toucher
   static int      lastX  = -1, lastY  = -1;   // derniere position vue pendant le toucher
   static uint32_t lastIdleTap = 0;  // pour double-tap sur idle
 
+  static uint32_t lastSeen = 0;     // derniere fois ou un contact a ete lu
   touchBus();                       // le tactile partage le bus SPI avec la carte SD
   if (!ts.touched()) {
-    if (down && cur == SCR_PLAY && startX >= 0) onPlayRelease(startX, startY, lastX, lastY);
+    // Anti-rebond : un contact qui "saute" 1 ou 2 lectures ne doit pas compter comme un relachement (40 ms sans contact)
+    if (down && millis() - lastSeen < 40) return;
+    if (down) {
+      lastRelease = millis();
+      if (cur == SCR_PLAY && startX >= 0) onPlayRelease(startX, startY, lastX, lastY);
+    }
     down = false; startX = startY = -1;
     return;
   }
 
-  lastTouchMs = millis();
+  lastSeen = lastTouchMs = millis();
   {
     TS_Point p0 = ts.getPoint();
-    lastX = map(p0.x, 200, 3700, 1, SCR_W);
-    lastY = map(p0.y, 240, 3800, 1, SCR_H);
+    lastX = constrain(map(p0.x, 200, 3700, 1, SCR_W), 0, SCR_W - 1);
+    lastY = constrain(map(p0.y, 240, 3800, 1, SCR_H), 0, SCR_H - 1);
   }
 
-  if (down || millis() - last < 250) return;
+  if (down || millis() - lastRelease < 30) return;
   down = true;
-  last = millis();
 
   int x = lastX, y = lastY;
 
@@ -1441,11 +1719,17 @@ void handleTouch() {
       saveSettings(); applyBrightness(); autoDimReset = true;
       drawMenuScreen(); return;
     }
-    // Bouton Reboot
-    if (y > 160 && y < 200) { ESP.restart(); }
+    // Rangee de boutons du bas : Diagnostic (gauche) / Redemarrer (droite)
+    if (y > 156 && y < 204) {
+      if (x < SCR_W / 2) { cur = SCR_SYS; drawSystemMemoryScreen(); return; }
+      ESP.restart();
+    }
     // Retour idle
     cur = SCR_WAIT; idleDrawn = false; return;
   }
+
+  // Ecran SYSTEME (v1.8)
+  if (cur == SCR_SYS) { sysScreenTap(); return; }
 
   // Ecrans meteo/news : DOUBLE-TAP pour revenir
   if (cur == SCR_IDLE_WX) {
@@ -1471,7 +1755,24 @@ void handleTouch() {
     }
     return;
   }
-  if (cur == SCR_IDLE_NEWS || cur == SCR_IDLE_PC) {
+
+  // Actualites (v1.8) : liste -> tap sur une ligne = detail ; detail -> tap n'importe ou = retour a la liste
+  if (cur == SCR_IDLE_NEWS) {
+    if (newsDetailIdx >= 0) { newsDetailIdx = -1; drawNewsScreen(); return; }
+    int row = newsRowHit(x, y);
+    if (row >= 0) { drawNewsDetailScreen(row); return; }
+    if (y < NEWS_HEAD_H) { cur = SCR_WAIT; idleDrawn = false; return; }      // tap sur l'en-tete = retour accueil
+    uint32_t now = millis();                                                 // sinon : double-tap = retour accueil (historique)
+    if (now - lastDetailTap < 600) {
+      cur = SCR_WAIT; idleDrawn = false;
+    } else {
+      lastDetailTap = now;
+      tft.setTextDatum(BC_DATUM); tft.setTextColor(C_ACCENT, C_BG);
+      tft.drawString("2x tap pour revenir", SCR_W/2, 239, 1);
+    }
+    return;
+  }
+  if (cur == SCR_IDLE_PC) {
     uint32_t now = millis();
     if (now - lastDetailTap < 600) {
       cur = SCR_WAIT; idleDrawn = false;
@@ -1500,7 +1801,7 @@ void handleTouch() {
       cur = SCR_IDLE_PC; drawIdlePcFull(true); return;
     }
     if (y >= IDLE_NEWS_BAND && y <= IDLE_NEWS_BAND + IDLE_NEWS_H) {
-      cur = SCR_IDLE_NEWS; drawNewsScreen(); return;
+      cur = SCR_IDLE_NEWS; newsDetailIdx = -1; drawNewsScreen(); return;
     }
     if (y >= IDLE_WX_Y && y <= IDLE_WX_Y + IDLE_WX_H) {
       cur = SCR_IDLE_WX; drawForecastScreen(); return;
@@ -1513,13 +1814,9 @@ void handleTouch() {
   startX = x; startY = y;
   if (fullCover || vizMode || lyricFull) return;           // la sortie se fait au relacher
 
-  // Boutons : reagissent des l'appui
-  if (y >= BTN_Y - 6 && y <= BTN_Y + BTN_H + 1) {
-    for (int i = 0; i < 3; i++) {
-      int bx = COL_X + i * BTN_STEP;
-      if (x >= bx - 4 && x <= bx + BTN_W + 4) { startX = -1; pressButton(i); return; }
-    }
-  }
+  // Boutons : reagissent des l'appui, zones contigues et generoues (voir playButtonHit)
+  int bi = playButtonHit(x, y);
+  if (bi >= 0) { startX = -1; pressButton(bi); return; }
   // Le reste (pochette, visualiseur, barre, paroles, balayages) est traite dans onPlayRelease()
 }
 
@@ -1568,6 +1865,8 @@ void handleNowPlaying() {
     trackDirty = true;
     coverDirty = true;
     if (fullCover) bigDirty = true;
+    coverFails = 0; coverFailId = "";        // v1.8 : nouvelle piste -> on repart d'un compteur d'echecs propre
+    lyricSeen = false; lyricPage = 0;
   }
   if (app != np.app || appId != np.appId) { np.app = app; np.appId = appId; headerDirty = true; }
   if (np.state != st) {
@@ -1588,6 +1887,8 @@ void handleNowPlaying() {
     String ly = d["lyric"] | "", lp = d["lyricPrev"] | "", ln = d["lyricNext"] | "";
     if (ly != np.lyric || lp != np.lyricPrev || ln != np.lyricNext) {
       np.lyric = ly; np.lyricPrev = lp; np.lyricNext = ln; lyricDirty = true;
+      lyricPage = 0; lyricPageMs = millis();
+      if (ly.length() || lp.length() || ln.length()) lyricSeen = true;
     }
   }
   np.duration = d["duration"] | 0.0f;
@@ -1600,42 +1901,99 @@ void handleNowPlaying() {
   if (needCover && sdLoad(SD_DIR_S, cid, coverBuf, COVER_MAX_BYTES, coverLen)) {
     coverIdStored = cid; coverDirty = true; needCover = false;
   }
+  // v1.8 : apres 3 echecs sur la meme piste on arrete de la redemander pendant 30 s (placeholder affiche) :
+  // plus de POST de 20 Ko en boucle qui fragmentent le heap et bloquent le tactile.
+  if (needCover && cid == coverFailId && coverFails >= COVER_MAX_FAILS && millis() - coverFailMs < 30000UL) needCover = false;
   // Pochette HD : seulement quand on est en plein ecran
   bool needBig = false;
-  if (fullCover && bigBuf && cid.length() > 0 && cid != bigIdStored) {
+  if (fullCover && cid.length() > 0 && cid != bigIdStored && bigEnsure()) {
     if (sdLoad(SD_DIR_B, cid, bigBuf, BIG_MAX_BYTES, bigLen)) { bigIdStored = cid; bigDirty = true; }
     else needBig = true;
   }
   sendReply(needCover, cfg.showApp && appId.length() > 0 && appId != iconIdStored, needBig);
 }
 
+// ---- Reception des images en STREAMING (multipart) : v1.8 ----
+// Avant : POST base64 -> le serveur copiait le corps (~20-27 Ko) puis une 2e copie pour le decodage = 40 a 80 Ko de RAM
+// CONTIGUE necessaires -> echecs aleatoires des que le heap se morcelait. Maintenant : chaque fragment (~1,4 Ko) est copie
+// directement dans le buffer de destination. Aucune allocation, 25 % de donnees en moins (pas de base64).
+// L'ancien POST base64 reste accepte (appli PC < 1.8).
+enum ImgKind : uint8_t { IMG_COVER, IMG_ICON, IMG_BIG };
+struct ImgRx { uint8_t* buf; size_t cap; size_t len; bool ok; bool streamed; };
+static ImgRx imgRx = { nullptr, 0, 0, false, false };
+
+static void imgUpload(ImgKind kind) {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    imgRx.streamed = true; imgRx.len = 0; imgRx.ok = true;
+    if      (kind == IMG_COVER) { imgRx.buf = coverBuf; imgRx.cap = COVER_MAX_BYTES; coverLen = 0; }   // invalide : jamais dessine a moitie ecrase
+    else if (kind == IMG_ICON)  { imgRx.buf = iconBuf;  imgRx.cap = ICON_MAX_BYTES;  iconLen  = 0; }
+    else                        { bigLen = 0; imgRx.buf = bigEnsure() ? bigBuf : nullptr; imgRx.cap = BIG_MAX_BYTES; }
+    if (!imgRx.buf) imgRx.ok = false;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!imgRx.ok) return;
+    if (imgRx.len + up.currentSize > imgRx.cap) { imgRx.ok = false; Serial.printf("[img] trop gros (> %u o)\n", (unsigned)imgRx.cap); return; }
+    memcpy(imgRx.buf + imgRx.len, up.buf, up.currentSize);
+    imgRx.len += up.currentSize;
+  } else if (up.status == UPLOAD_FILE_END) {
+    bool eoi = false;
+    if (imgRx.ok && imgRx.len >= 4 && imgRx.buf[0] == 0xFF && imgRx.buf[1] == 0xD8)
+      for (size_t i = imgRx.len >= 8 ? imgRx.len - 8 : 0; i + 1 < imgRx.len; i++)
+        if (imgRx.buf[i] == 0xFF && imgRx.buf[i + 1] == 0xD9) { eoi = true; break; }
+    if (!eoi) { Serial.printf("[img] JPEG invalide/tronque (%u o)\n", (unsigned)imgRx.len); imgRx.ok = false; }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    imgRx.ok = false;
+  }
+}
+static void uploadCover() { imgUpload(IMG_COVER); }
+static void uploadIcon()  { imgUpload(IMG_ICON); }
+static void uploadBig()   { imgUpload(IMG_BIG); }
+
+// true si la requete etait en streaming ; renseigne ok + taille
+static bool imgStreamResult(bool& ok, size_t& len) {
+  if (!imgRx.streamed) return false;
+  imgRx.streamed = false; ok = imgRx.ok; len = imgRx.len;
+  return true;
+}
+
 void handleCover() {
-  if (!decodeJpegBody(coverBuf, COVER_MAX_BYTES, coverLen)) {
+  diag::HeapScope hs("cover-rx");
+  const String id = server.arg("id");
+  size_t n = 0; bool ok = false;
+  if (!imgStreamResult(ok, n)) { coverLen = 0; ok = decodeJpegBody(coverBuf, COVER_MAX_BYTES, n, "cover"); }
+  if (!ok) {
+    coverLen = 0; coverIdStored = "";
+    registerCoverFail(id, "reception");
     server.send(400, "application/json", "{\"ok\":false}");
     return;
   }
-  coverIdStored = server.arg("id");
+  coverLen = n; coverIdStored = id;
+  coverFails = 0; coverFailId = "";
   coverDirty = true;
+  server.send(200, "application/json", "{\"ok\":true}");      // on repond AVANT d'ecrire sur la SD : le PC n'attend plus la FAT
   sdSave(SD_DIR_S, coverIdStored, coverBuf, coverLen);
-  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleBigCover() {
-  if (!bigBuf || !decodeJpegBody(bigBuf, BIG_MAX_BYTES, bigLen)) {
+  diag::HeapScope hs("coverbig-rx");
+  const String id = server.arg("id");
+  size_t n = 0; bool ok = false;
+  if (!imgStreamResult(ok, n)) { bigLen = 0; ok = bigEnsure() && decodeJpegBody(bigBuf, BIG_MAX_BYTES, n, "big"); }
+  if (!ok) {
+    bigLen = 0; bigIdStored = "";
     server.send(400, "application/json", "{\"ok\":false}");
     return;
   }
-  bigIdStored = server.arg("id");
-  bigDirty = true;
-  sdSave(SD_DIR_B, bigIdStored, bigBuf, bigLen);
+  bigLen = n; bigIdStored = id; bigDirty = true;
   server.send(200, "application/json", "{\"ok\":true}");
+  sdSave(SD_DIR_B, bigIdStored, bigBuf, bigLen);
 }
 
 void handleIcon() {
-  if (!decodeJpegBody(iconBuf, ICON_MAX_BYTES, iconLen)) {
-    server.send(400, "application/json", "{\"ok\":false}");
-    return;
-  }
+  size_t n = 0; bool ok = false;
+  if (!imgStreamResult(ok, n)) { iconLen = 0; ok = decodeJpegBody(iconBuf, ICON_MAX_BYTES, n); }
+  if (!ok) { iconLen = 0; server.send(400, "application/json", "{\"ok\":false}"); return; }
+  iconLen = n;
   iconIdStored = server.arg("id");
   headerDirty = true;
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1721,7 +2079,7 @@ void handleStatus() {
   d["chipTemp"] = temperatureRead();
   d["screen"] = (cur == SCR_PLAY) ? (fullCover ? "cover" : vizMode ? "viz" : lyricFull ? "lyrics" : "play")
               : (cur == SCR_WAIT) ? "idle" : (cur == SCR_IDLE_WX) ? "weather" : (cur == SCR_IDLE_NEWS) ? "news"
-              : (cur == SCR_IDLE_PC) ? "pc" : (cur == SCR_MENU) ? "menu" : "wifi";
+              : (cur == SCR_IDLE_PC) ? "pc" : (cur == SCR_SYS) ? "system" : (cur == SCR_MENU) ? "menu" : "wifi";
   d["title"] = hasTrack ? np.title : "";
   d["artist"] = hasTrack ? np.artist : "";
   d["brightnessPct"] = cfg.briPct;
@@ -1771,6 +2129,7 @@ void handlePcStats() {
 }
 
 void handleIdle() {
+  diag::HeapScope hs("rss-parse");                         // heap avant/apres le parsing des actus
   JsonDocument d;
   if (!server.hasArg("plain") || deserializeJson(d, server.arg("plain"))) {
     server.send(400, "application/json", "{\"ok\":false}");
@@ -1793,10 +2152,27 @@ void handleIdle() {
 
   // Parser le tableau news
   idleData.newsCount = 0;
-  JsonArray arr = d["news"].as<JsonArray>();
-  for (JsonVariant v : arr) {
-    if (idleData.newsCount >= 10) break;
-    idleData.news[idleData.newsCount++] = cleanUTF8(v.as<String>());
+  for (int i = 0; i < 10; i++) { idleData.newsMeta[i].desc = ""; idleData.newsMeta[i].when = ""; idleData.newsMeta[i].src = ""; }
+  JsonArray items = d["newsItems"].as<JsonArray>();         // v1.8 : [{t:titre, d:resume, p:heure, s:source}]
+  if (!items.isNull() && items.size() > 0) {
+    for (JsonObject it : items) {
+      if (idleData.newsCount >= 10) break;
+      String t = cleanUTF8(String((const char*)(it["t"] | "")));
+      if (!t.length()) continue;
+      const int k = idleData.newsCount++;
+      idleData.news[k] = t;
+      String desc = cleanUTF8(String((const char*)(it["d"] | "")));
+      if (desc.length() > NEWS_DESC_MAX) desc.remove(NEWS_DESC_MAX);
+      idleData.newsMeta[k].desc = desc;
+      idleData.newsMeta[k].when = cleanUTF8(String((const char*)(it["p"] | "")));
+      idleData.newsMeta[k].src  = cleanUTF8(String((const char*)(it["s"] | "")));
+    }
+  } else {                                                   // ancienne appli PC : titres seuls
+    JsonArray arr = d["news"].as<JsonArray>();
+    for (JsonVariant v : arr) {
+      if (idleData.newsCount >= 10) break;
+      idleData.news[idleData.newsCount++] = cleanUTF8(v.as<String>());
+    }
   }
 
   Serial.printf("[idle] temp=%.1f code=%d hasData=%d loc=%s news=%d\n",
@@ -1809,7 +2185,12 @@ void handleIdle() {
   } else if (cur == SCR_IDLE_WX && wxDetailDay < 0) {
     drawForecastScreen();          // la page semaine suit les nouvelles donnees
   } else if (cur == SCR_IDLE_NEWS) {
-    drawNewsScreen();
+    if (newsDetailIdx >= 0) {
+      // Detail ouvert : on ne le redessine que si l'article affiche a disparu (sinon pas de clignotement en pleine lecture)
+      if (newsDetailIdx >= idleData.newsCount || idleData.news[newsDetailIdx] != newsDetailTitle) { newsDetailIdx = -1; drawNewsScreen(); }
+    } else {
+      drawNewsScreen();
+    }
   }
 
   server.send(200, "application/json", "{\"ok\":true}");
@@ -2007,7 +2388,7 @@ void drawNewsScreen() {
     tft.setTextDatum(MC_DATUM);
     tft.drawString("Aucune actualite disponible", SCR_W / 2, 120);
   } else {
-    const int ROW_H = 34, GAP = 4, Y0 = 38, MAXR = 5, TXT_X = 36, TXT_W = 300 - (TXT_X - 10) - 12;
+    const int ROW_H = 34, GAP = 4, Y0 = 38, MAXR = 5, TXT_X = 36, TXT_W = 300 - (TXT_X - 10) - 28;
     const int n = idleData.newsCount < MAXR ? idleData.newsCount : MAXR;
     char line[112];
     for (int i = 0; i < n; i++) {
@@ -2018,12 +2399,103 @@ void drawNewsScreen() {
       tft.setTextColor(C_TEXT, ui::C_CARD);
       tft.setTextDatum(ML_DATUM);
       tft.drawString(line, TXT_X, y + ROW_H / 2);
+      tft.drawLine(296, y + 12, 301, y + 17, C_DIM);          // chevron ">" : la ligne ouvre le detail
+      tft.drawLine(301, y + 17, 296, y + 22, C_DIM);
     }
   }
   tft.setTextFont(1);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(C_TRACK, C_BG);
-  tft.drawString("Tap pour revenir", SCR_W / 2, 231);
+  tft.drawString("Touche une actu pour la lire", SCR_W / 2, 231);
+}
+
+// ----------------------------- Detail d'une actualite (v1.8) -----------
+// Meme langage visuel que le detail d'un jour meteo : fond noir, carte anthracite arrondie, bouton "< Retour".
+// Texte nettoye par cleanUTF8() a la RECEPTION (handleIdle). Word-wrap via txt::wrap (coupe aux espaces uniquement).
+void drawNewsDetailScreen(int newsIndex) {
+  if (newsIndex < 0 || newsIndex >= idleData.newsCount) { newsDetailIdx = -1; drawNewsScreen(); return; }
+  newsDetailIdx   = newsIndex;
+  newsDetailTitle = idleData.news[newsIndex];
+  const NewsMeta& m = idleData.newsMeta[newsIndex];
+  const int total = idleData.newsCount < 5 ? idleData.newsCount : 5;
+
+  tft.fillScreen(C_BG);
+  const int CX = 10, CY = 6, CW = 300, CH = 198, PAD = 12;
+  const int IX = CX + PAD, IW = CW - 2 * PAD;                 // 276 px utiles
+  tft.fillRoundRect(CX, CY, CW, CH, 12, ui::C_CARD);
+
+  // 1) En-tete : pastille ambre "ACTUALITE n/N" + source et heure de publication si disponibles
+  char badge[24];
+  snprintf(badge, sizeof(badge), "ACTUALITE %d/%d", newsIndex + 1, total);
+  tft.setTextFont(2);
+  const int bw = tft.textWidth(badge) + 16;
+  tft.fillRoundRect(IX, CY + 10, bw, 20, 10, ui::C_AMBER);
+  tft.setTextColor(C_BG, ui::C_AMBER);                        // texte noir sur ambre
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(badge, IX + bw / 2, CY + 20);
+  int rx = IX + IW;                                           // bord droit disponible
+  tft.setTextColor(C_DIM, ui::C_CARD);
+  tft.setTextDatum(MR_DATUM);
+  if (m.when.length()) { tft.drawString(m.when, rx, CY + 20); rx -= tft.textWidth(m.when) + 10; }
+  if (m.src.length()) {
+    const int room = rx - (IX + bw + 10);
+    if (room > 30) { char sb[40]; ellipsizeOn(tft, m.src.c_str(), sb, sizeof(sb), room); tft.drawString(sb, rx, CY + 20); }
+  }
+
+  // 2) Titre complet : le plus grand corps qui tient (12 pt gras, sinon 9 pt gras) ; plus de lignes s'il n'y a pas de resume
+  const bool  hasDesc = m.desc.length() > 0;
+  const char* title   = idleData.news[newsIndex].c_str();
+  txt::Line   tl[8];
+  bool        tTrunc  = false;
+  int         tLineH  = 28;
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  int tn = txt::wrap(title, IW, tftWidthN, tl, hasDesc ? 2 : 5, &tTrunc);
+  if (tTrunc) {
+    tft.setFreeFont(&FreeSansBold9pt7b);
+    tLineH = 22;
+    tn = txt::wrap(title, IW, tftWidthN, tl, hasDesc ? 3 : 7, &tTrunc);
+  }
+  const int TY = CY + 40;
+  tft.setTextColor(C_TEXT, ui::C_CARD);
+  tft.setTextDatum(ML_DATUM);
+  int y = TY + tLineH / 2;
+  for (int i = 0; i < tn; i++, y += tLineH) {
+    if (i == tn - 1 && tTrunc) {                              // titre vraiment trop long : derniere ligne en "..."
+      char eb[160]; ellipsizeOn(tft, title + tl[i].start, eb, sizeof(eb), IW); tft.drawString(eb, IX, y);
+    } else {
+      drawSlice(title, tl[i], IX, y);
+    }
+  }
+
+  // 3) Resume (gris #8E8E93) dans la place restante, derniere ligne en "..." si tronque
+  const int sepY = TY + tn * tLineH + 2, bottom = CY + CH - 8;
+  if (hasDesc) {
+    tft.drawFastHLine(IX, sepY, IW, C_TRACK);
+    tft.setFreeFont(&FreeSans9pt7b);
+    const int dLineH = 21, descTop = sepY + 6;
+    int dMax = (bottom - descTop) / dLineH;
+    if (dMax > 6) dMax = 6;
+    if (dMax >= 1) {
+      txt::Line dl[6];
+      bool dTrunc = false;
+      const char* desc = m.desc.c_str();
+      int dn = txt::wrap(desc, IW, tftWidthN, dl, dMax, &dTrunc);
+      tft.setTextColor(C_DIM, ui::C_CARD);
+      y = descTop + dLineH / 2;
+      for (int i = 0; i < dn; i++, y += dLineH) {
+        if (i == dn - 1 && dTrunc) { char eb[160]; ellipsizeOn(tft, desc + dl[i].start, eb, sizeof(eb), IW); tft.drawString(eb, IX, y); }
+        else drawSlice(desc, dl[i], IX, y);
+      }
+    }
+  }
+
+  // 4) Bouton retour discret (un tap n'importe ou revient aussi a la liste)
+  tft.fillRoundRect(110, 210, 100, 24, 10, C_BTN);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(C_TEXT, C_BTN);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("< Retour", 160, 222);
+  tft.setTextFont(1);
 }
 
 // ----------------------------- Menu systeme ----------------------------
@@ -2068,15 +2540,306 @@ void drawMenuScreen() {
   tft.setTextColor(C_DIM, C_BG);
   tft.drawString("Mise a jour via le panel PC", SCR_W/2, 140, 1);
 
-  // Bouton Reboot
-  tft.fillRoundRect(90, 162, 140, 30, 8, RGB565(80,20,20));
+  // Boutons : Diagnostic (v1.8) / Reboot
+  tft.setTextDatum(MC_DATUM);
+  tft.fillRoundRect(20, 162, 130, 30, 8, C_BTN);
+  tft.setTextColor(C_TEXT, C_BTN);
+  tft.drawString("Diagnostic", 85, 177, 2);
+  tft.fillRoundRect(170, 162, 130, 30, 8, RGB565(80,20,20));
   tft.setTextColor(C_TEXT, RGB565(80,20,20));
-  tft.drawString("Redemarrer", SCR_W/2, 177, 2);
+  tft.drawString("Redemarrer", 235, 177, 2);
 
   // Retour
   tft.setTextDatum(BC_DATUM);
   tft.setTextColor(RGB565(45,45,65), C_BG);
   tft.drawString("Tap ailleurs pour revenir", SCR_W/2, 238, 1);
+}
+
+// ----------------------------- Ecran Systeme : memoire & stockage (v1.8) -----
+// Acces : menu (tap en haut a droite de l'accueil) -> "Diagnostic". Page 1 = RAM temps reel (rafraichie chaque seconde),
+// page 2 = stockage (flash, SPIFFS, SD + fichiers en cache). Tap = page suivante, puis retour au menu.
+// Les memes donnees sont disponibles en JSON : http://nowplaying.local/api/diag
+static uint8_t  sysPage = 0;
+static uint32_t sysLastMs = 0;
+static int      sysGraphHead = -1;
+static bool     spiffsTried = false, spiffsOk = false;
+static const uint16_t C_OK  = RGB565(48, 209, 88);
+static const uint16_t C_BAD = RGB565(255, 69, 58);
+
+static uint16_t levelColor(uint32_t v, uint32_t warn, uint32_t good) { return v >= good ? C_OK : (v >= warn ? ui::C_AMBER : C_BAD); }
+
+static void fmtBytes(char* o, size_t n, uint32_t b) {
+  if (b >= 1048576UL) snprintf(o, n, "%u.%02u Mo", (unsigned)(b / 1048576UL), (unsigned)((b % 1048576UL) * 100 / 1048576UL));
+  else                snprintf(o, n, "%u.%u Ko", (unsigned)(b / 1024), (unsigned)((b % 1024) * 10 / 1024));
+}
+
+static void sysBar(int x, int y, int w, int h, uint32_t val, uint32_t tot, uint16_t col) {
+  tft.fillRoundRect(x, y, w, h, h / 2, C_TRACK);
+  if (tot == 0) return;
+  if (val > tot) val = tot;
+  int fw = (int)(((uint64_t)w * val) / tot);
+  if (val > 0 && fw < h) fw = h;
+  if (fw > 0) tft.fillRoundRect(x, y, fw, h, h / 2, col);
+}
+
+// Ligne "libelle ....... valeur" (police 2). La valeur est effacee avant redessin : pas de residu quand elle raccourcit.
+static void sysRow(int y, const char* label, const char* value, uint16_t col, uint16_t bg) {
+  tft.setTextFont(2);
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(C_DIM, bg);
+  tft.drawString(label, 20, y);
+  tft.fillRect(170, y, 130, 16, bg);
+  tft.setTextDatum(TR_DATUM); tft.setTextColor(col, bg);
+  tft.drawString(value, 300, y);
+}
+
+// Courbe : heap libre (bleu) et plus grand bloc contigu (ambre). Quand les deux courbes s'ecartent = fragmentation.
+static void sysDrawGraph() {
+  const int GX = 20, GY = 177, GW = 280, GH = 40;
+  tft.fillRect(GX - 2, GY - 2, GW + 4, GH + 4, ui::C_CARD);
+  diag::History& H = diag::hist();
+  sysGraphHead = H.head;
+  if (H.n < 2) {
+    tft.setTextFont(1); tft.setTextDatum(MC_DATUM); tft.setTextColor(C_DIM, ui::C_CARD);
+    tft.drawString("collecte en cours...", GX + GW / 2, GY + GH / 2);
+    return;
+  }
+  uint32_t mn = 0xFFFFFFFFu, mx = 0;
+  for (int i = 0; i < H.n; i++) {
+    uint32_t v = diag::histFree(i), w = diag::histMaxBlk(i);
+    if (v < mn) mn = v;
+    if (w < mn) mn = w;
+    if (v > mx) mx = v;
+  }
+  if (mx < mn + 2048) mx = mn + 2048;                              // echelle minimale : 2 Ko
+  for (int pass = 0; pass < 2; pass++) {
+    const uint16_t col = pass ? ui::C_AMBER : ui::C_BLUE;
+    int px = 0, py = 0;
+    for (int i = 0; i < H.n; i++) {
+      uint32_t v = pass ? diag::histMaxBlk(i) : diag::histFree(i);
+      if (v < mn) v = mn;
+      if (v > mx) v = mx;
+      int x = GX + (int)(((long)i * (GW - 1)) / (H.n - 1));
+      int y = GY + GH - 1 - (int)(((uint64_t)(v - mn) * (GH - 1)) / (mx - mn));
+      if (i) tft.drawLine(px, py, x, y, col);
+      px = x; py = y;
+    }
+  }
+}
+
+// Page 1. frame=true : redessine tout ; sinon seulement les valeurs qui bougent (pas de clignotement).
+static void sysDrawMem(bool frame) {
+  const diag::Heap h = diag::snap();
+  diag::note(h);
+  char a[32], b[32];
+  if (frame) {
+    tft.fillScreen(C_BG);
+    tft.setFreeFont(&FreeSansBold9pt7b);
+    tft.setTextColor(C_TEXT, C_BG); tft.setTextDatum(ML_DATUM);
+    tft.drawString("Systeme", 10, 14);
+    tft.setTextFont(1);
+    tft.fillRoundRect(10, 28, 300, 84, 10, ui::C_CARD);
+    tft.fillRoundRect(10, 116, 300, 40, 10, ui::C_CARD);
+    tft.fillRoundRect(10, 160, 300, 62, 10, ui::C_CARD);
+    tft.setTextDatum(BC_DATUM); tft.setTextColor(C_TRACK, C_BG);
+    tft.drawString("Tap : stockage  >", SCR_W / 2, 239, 1);
+  }
+  // Uptime
+  diag::fmtUptime(a, sizeof(a), millis() / 1000);
+  snprintf(b, sizeof(b), "up %s", a);
+  tft.setTextFont(2);
+  tft.fillRect(150, 4, 165, 18, C_BG);
+  tft.setTextDatum(TR_DATUM); tft.setTextColor(C_DIM, C_BG);
+  tft.drawString(b, 312, 6);
+
+  // Carte A : heap
+  const int frag = diag::fragPct(h);
+  fmtBytes(a, sizeof(a), h.freeB);
+  sysRow(34, "Heap libre", a, levelColor(h.freeB, 35000, 60000), ui::C_CARD);
+  sysBar(20, 52, 280, 6, h.freeB, ESP.getHeapSize(), levelColor(h.freeB, 35000, 60000));
+  fmtBytes(a, sizeof(a), h.maxBlk);
+  sysRow(62, "Plus grand bloc", a, levelColor(h.maxBlk, diag::WARN_MAXBLK, 40000), ui::C_CARD);
+  sysBar(20, 80, 280, 6, h.maxBlk, h.freeB, levelColor(h.maxBlk, diag::WARN_MAXBLK, 40000));
+  snprintf(a, sizeof(a), "%d %%", frag);
+  sysRow(90, "Fragmentation", a, levelColor((uint32_t)(100 - frag), 50, 75), ui::C_CARD);
+
+  // Carte B : extremes depuis le demarrage
+  const uint32_t worst = (diag::hist().worstBlk == 0xFFFFFFFFu) ? h.maxBlk : diag::hist().worstBlk;
+  fmtBytes(a, sizeof(a), h.minFree);
+  sysRow(120, "Min. libre (boot)", a, levelColor(h.minFree, 20000, 40000), ui::C_CARD);
+  fmtBytes(a, sizeof(a), worst);
+  sysRow(136, "Pire bloc contigu", a, levelColor(worst, diag::WARN_MAXBLK, 40000), ui::C_CARD);
+
+  // Carte C : courbe + verdict de derive
+  tft.setTextFont(1);
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(C_DIM, ui::C_CARD);
+  tft.drawString("Heap libre / bloc max  (4 min)", 20, 165);
+  const bool leak = diag::leakSuspected();
+  tft.fillRect(240, 164, 62, 10, ui::C_CARD);
+  tft.setTextDatum(TR_DATUM); tft.setTextColor(leak ? C_BAD : C_OK, ui::C_CARD);
+  tft.drawString(leak ? "FUITE ?" : "stable", 300, 165);
+  if (frame || diag::hist().head != sysGraphHead) sysDrawGraph();
+  tft.setTextFont(1);
+}
+
+// ---- Stockage : scan du cache de pochettes sur la SD (a l'ouverture de la page, pas en continu : la FAT est lente) ----
+struct SdEntry { char name[22]; uint32_t size; };
+static SdEntry  sdLast[7];
+static uint32_t sdScanCount = 0, sdCacheBytes = 0;
+
+static void sdScanCache() {
+  sdScanCount = 0; sdCacheBytes = 0;
+  if (!sdOk) return;
+  sdBus();
+  const char* dirs[2] = { SD_DIR_S, SD_DIR_B };
+  for (int k = 0; k < 2; k++) {
+    File d = SD.open(dirs[k]);
+    if (!d) continue;
+    File f = d.openNextFile();
+    while (f) {
+      if (!f.isDirectory()) {
+        const char* nm = f.name();
+        const char* sl = strrchr(nm, '/');
+        SdEntry& e = sdLast[sdScanCount % 7];                // tampon circulaire : on garde les 7 derniers (~ plus recents)
+        snprintf(e.name, sizeof(e.name), "%c/%s", k ? 'b' : 's', sl ? sl + 1 : nm);
+        e.size = (uint32_t)f.size();
+        sdCacheBytes += e.size;
+        sdScanCount++;
+      }
+      f.close();
+      f = d.openNextFile();
+    }
+    d.close();
+  }
+  touchBus();                                                // rend le bus SPI partage au tactile
+}
+
+static void sysDrawStorage() {
+  tft.fillScreen(C_BG);
+  tft.setFreeFont(&FreeSansBold9pt7b);
+  tft.setTextColor(C_TEXT, C_BG); tft.setTextDatum(ML_DATUM);
+  tft.drawString("Stockage", 10, 14);
+  tft.setTextFont(2); tft.setTextDatum(MC_DATUM); tft.setTextColor(C_DIM, C_BG);
+  tft.drawString("Lecture...", SCR_W / 2, 120);
+
+  sdScanCache();
+  if (!spiffsTried) { spiffsTried = true; spiffsOk = SPIFFS.begin(false); }   // false = ne formate jamais
+
+  tft.fillRect(0, 28, SCR_W, 212, C_BG);
+  char a[32], b[32];
+  // Firmware (slot OTA)
+  const uint32_t sk = ESP.getSketchSize(), skTot = sk + ESP.getFreeSketchSpace();
+  fmtBytes(a, sizeof(a), sk); fmtBytes(b, sizeof(b), skTot);
+  char v[72]; snprintf(v, sizeof(v), "%s / %s", a, b);
+  sysRow(28, "Firmware (slot OTA)", v, levelColor(skTot - sk, 100000, 300000), C_BG);
+  sysBar(20, 46, 280, 5, sk, skTot, C_ACCENT);
+  // SPIFFS
+  if (spiffsOk) {
+    fmtBytes(a, sizeof(a), (uint32_t)SPIFFS.usedBytes()); fmtBytes(b, sizeof(b), (uint32_t)SPIFFS.totalBytes());
+    snprintf(v, sizeof(v), "%s / %s", a, b);
+    sysRow(56, "SPIFFS", v, C_TEXT, C_BG);
+    sysBar(20, 74, 280, 5, SPIFFS.usedBytes(), SPIFFS.totalBytes(), ui::C_BLUE);
+  } else {
+    sysRow(56, "SPIFFS", "non monte (inutilise)", C_DIM, C_BG);
+  }
+  // Carte SD
+  if (!cfg.sdCache)  sysRow(84, "Carte SD", "cache desactive", C_DIM, C_BG);
+  else if (!sdOk)    sysRow(84, "Carte SD", "absente", C_BAD, C_BG);
+  else {
+    snprintf(v, sizeof(v), "%u Mo", (unsigned)sdSizeMB);
+    sysRow(84, "Carte SD", v, C_TEXT, C_BG);
+    fmtBytes(a, sizeof(a), sdCacheBytes);
+    snprintf(v, sizeof(v), "cache : %u fichiers, %s (max %u pistes)", (unsigned)sdScanCount, a, (unsigned)cfg.sdMax);
+    tft.setTextFont(1); tft.setTextDatum(TL_DATUM); tft.setTextColor(C_DIM, C_BG);
+    tft.drawString(v, 20, 102);
+  }
+  // Buffers RAM des images
+  tft.setTextFont(1); tft.setTextDatum(TL_DATUM); tft.setTextColor(C_DIM, C_BG);
+  snprintf(v, sizeof(v), "RAM : cover %u/%u  HD %u/%u  icone %u/%u o", (unsigned)coverLen, (unsigned)COVER_MAX_BYTES,
+           (unsigned)bigLen, (unsigned)BIG_MAX_BYTES, (unsigned)iconLen, (unsigned)ICON_MAX_BYTES);
+  tft.drawString(v, 20, 114);
+  if (coverFails) { snprintf(v, sizeof(v), "cover : %u echec(s) sur la piste en cours", (unsigned)coverFails); tft.setTextColor(C_BAD, C_BG); tft.drawString(v, 20, 125); }
+
+  // Fichiers en cache (les 7 derniers du scan, ordre FAT ~ creation)
+  tft.setTextColor(C_TEXT, C_BG);
+  tft.drawString("Derniers fichiers en cache", 20, 140);
+  const int cnt = sdScanCount < 7 ? (int)sdScanCount : 7;
+  const int start = sdScanCount > 7 ? (int)(sdScanCount % 7) : 0;
+  tft.setTextColor(C_DIM, C_BG);
+  if (cnt == 0) tft.drawString("(aucun)", 20, 153);
+  for (int i = 0; i < cnt; i++) {
+    const SdEntry& e = sdLast[(start + i) % 7];
+    fmtBytes(a, sizeof(a), e.size);
+    tft.drawString(e.name, 20, 153 + i * 11);
+    tft.setTextDatum(TR_DATUM); tft.drawString(a, 300, 153 + i * 11); tft.setTextDatum(TL_DATUM);
+  }
+  tft.setTextDatum(BC_DATUM); tft.setTextColor(C_TRACK, C_BG);
+  tft.drawString("Tap : retour au menu", SCR_W / 2, 239, 1);
+  tft.setTextFont(1);
+}
+
+// Dump complet sur le port serie (appele a l'ouverture de l'ecran et par /api/diag?dump=1)
+static void diagDumpSerial() {
+  const diag::Heap h = diag::snap();
+  char up[24]; diag::fmtUptime(up, sizeof(up), millis() / 1000);
+  Serial.printf("[diag] up=%s heap: free=%u max=%u min=%u total=%u frag=%d%% worstBlk=%u leak=%d\n", up,
+                (unsigned)h.freeB, (unsigned)h.maxBlk, (unsigned)h.minFree, (unsigned)ESP.getHeapSize(), diag::fragPct(h),
+                (unsigned)diag::hist().worstBlk, (int)diag::leakSuspected());
+  Serial.printf("[diag] flash: sketch=%u free=%u | cover=%u/%u big=%u/%u icon=%u/%u | coverFails=%u\n",
+                (unsigned)ESP.getSketchSize(), (unsigned)ESP.getFreeSketchSpace(), (unsigned)coverLen, (unsigned)COVER_MAX_BYTES,
+                (unsigned)bigLen, (unsigned)BIG_MAX_BYTES, (unsigned)iconLen, (unsigned)ICON_MAX_BYTES, (unsigned)coverFails);
+}
+
+void drawSystemMemoryScreen() {
+  sysPage = 0;
+  sysLastMs = millis();
+  sysGraphHead = -1;
+  diagDumpSerial();
+  sysDrawMem(true);
+}
+
+void sysScreenTap() {
+  if (sysPage == 0) { sysPage = 1; sysDrawStorage(); }
+  else              { sysPage = 0; cur = SCR_MENU; drawMenuScreen(); }
+}
+
+static void tickSysScreen() {
+  if (cur != SCR_SYS || sysPage != 0) return;
+  if (millis() - sysLastMs < 1000) return;
+  sysLastMs = millis();
+  sysDrawMem(false);
+}
+
+// GET /api/diag : memes donnees en JSON + historique (48 points x 5 s) pour tracer une fuite depuis le PC
+void handleDiag() {
+  const diag::Heap h = diag::snap();
+  JsonDocument d;
+  d["version"] = FW_VERSION;
+  d["uptime"]  = millis() / 1000;
+  d["heap"]["free"]       = h.freeB;
+  d["heap"]["maxBlock"]   = h.maxBlk;
+  d["heap"]["minFree"]    = h.minFree;
+  d["heap"]["total"]      = ESP.getHeapSize();
+  d["heap"]["fragPct"]    = diag::fragPct(h);
+  d["heap"]["worstBlock"] = diag::hist().worstBlk;
+  d["heap"]["leakSuspected"] = diag::leakSuspected();
+  d["flash"]["sketch"]     = ESP.getSketchSize();
+  d["flash"]["freeSketch"] = ESP.getFreeSketchSpace();
+  d["flash"]["chip"]       = ESP.getFlashChipSize();
+  d["buffers"]["cover"] = coverLen;
+  d["buffers"]["big"]   = bigLen;
+  d["buffers"]["icon"]  = iconLen;
+  d["cover"]["fails"]   = coverFails;
+  d["cover"]["failId"]  = coverFailId;
+  d["sd"]["enabled"] = cfg.sdCache;
+  d["sd"]["ok"]      = sdOk;
+  d["sd"]["sizeMB"]  = sdSizeMB;
+  d["sd"]["files"]   = sdCount;
+  JsonArray hf = d["history"]["free"].to<JsonArray>();
+  JsonArray hb = d["history"]["maxBlock"].to<JsonArray>();
+  for (int i = 0; i < diag::hist().n; i++) { hf.add(diag::histFree(i)); hb.add(diag::histMaxBlk(i)); }
+  String out;
+  serializeJson(d, out);
+  server.send(200, "application/json", out);
 }
 
 // ----------------------------- Detail d'un jour meteo (v1.7) -----------
@@ -2338,8 +3101,7 @@ static bool is24GHz(int32_t ch) { return ch >= 1 && ch <= 13; }
 
 // Scanne les reseaux et retourne le canal + BSSID du meilleur AP 2.4 GHz pour WIFI_SSID.
 // Renvoie -1 si rien trouve.
-static int scanFor24GHz(uint8_t* bssidOut) {
-  int n = WiFi.scanNetworks(/*async*/false, /*show_hidden*/false);
+static int pick24GHz(int n, uint8_t* bssidOut) {
   int bestRssi = -9999, bestCh = -1;
   for (int i = 0; i < n; i++) {
     if (WiFi.SSID(i) != wifiSsid) continue;
@@ -2349,8 +3111,13 @@ static int scanFor24GHz(uint8_t* bssidOut) {
     Serial.printf("[scan] %s ch%d rssi=%d\n", WiFi.BSSIDstr(i).c_str(), ch, rssi);
     if (rssi > bestRssi) { bestRssi = rssi; bestCh = ch; memcpy(bssidOut, WiFi.BSSID(i), 6); }
   }
-  WiFi.scanDelete();
   return bestCh;
+}
+static int scanFor24GHz(uint8_t* bssidOut) {            // scan BLOQUANT : uniquement au demarrage
+  int n = WiFi.scanNetworks(/*async*/false, /*show_hidden*/false);
+  int ch = pick24GHz(n, bssidOut);
+  WiFi.scanDelete();
+  return ch;
 }
 
 void startPortal() {
@@ -2376,6 +3143,7 @@ void stopPortal() {
   dnsServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   portalActive = false;
 }
 
@@ -2387,6 +3155,7 @@ void wifiTask() {
     Serial.printf("[wifi] connecte, IP %s\n", WiFi.localIP().toString().c_str());
     wifiError = "";
     everConnected = true;
+    wifiFastSave(WiFi.channel(), WiFi.BSSID());
     stopPortal();
     MDNS.end();
     if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
@@ -2420,19 +3189,66 @@ void wifiTask() {
   }
   // Pas de Wi-Fi memorise, ou jamais connecte 90 s apres le demarrage -> portail de configuration
   if (!up && !portalActive && (wifiSsid.length() == 0 || (!everConnected && millis() > 90000UL))) startPortal();
-  if (!up && wifiSsid.length() && millis() - lastTry > (portalActive ? 60000UL : 10000UL)) {
-    lastTry = millis();
-    Serial.println("[wifi] scan + reconnexion 2.4 GHz...");
-    WiFi.disconnect();
-    uint8_t bssid[6];
-    int ch = scanFor24GHz(bssid);
-    if (ch > 0) {
-      Serial.printf("[wifi] connexion au BSSID 2.4 GHz, ch%d\n", ch);
-      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), ch, bssid);
-    } else {
-      Serial.println("[wifi] aucun AP 2.4 GHz trouve, essai sans BSSID");
-      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  // v1.8 : scan ASYNCHRONE. L'ancien scan bloquant gelait l'ecran et le tactile 2-3 s toutes les 10 s hors connexion.
+  static bool     scanRunning = false;
+  static uint32_t scanStart   = 0;
+  if (up) { scanRunning = false; return; }
+  if (wifiSsid.length()) {
+    if (!scanRunning && millis() - lastTry > (portalActive ? 60000UL : 10000UL)) {
+      lastTry = millis();
+      Serial.println("[wifi] scan + reconnexion 2.4 GHz...");
+      WiFi.disconnect();
+      WiFi.scanNetworks(/*async*/true, /*show_hidden*/false);
+      scanRunning = true; scanStart = millis();
+    } else if (scanRunning) {
+      const int n = WiFi.scanComplete();
+      if (n == WIFI_SCAN_RUNNING && millis() - scanStart < 12000UL) return;   // pas fini : on rend la main a l'UI
+      scanRunning = false;
+      uint8_t bssid[6];
+      const int ch = (n > 0) ? pick24GHz(n, bssid) : -1;
+      WiFi.scanDelete();
+      if (ch > 0) {
+        Serial.printf("[wifi] connexion au BSSID 2.4 GHz, ch%d\n", ch);
+        WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), ch, bssid);
+      } else {
+        Serial.println("[wifi] aucun AP 2.4 GHz trouve, essai sans BSSID");
+        WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+      }
     }
+  }
+}
+
+// ----------------------------- Memoire : sprites selon l'ecran (v1.8) --------
+// Avant : titre+barre+eq (48 Ko) ET dashboard (29 Ko) alloues en permanence, alors que l'accueil et la lecture ne
+// s'affichent jamais ensemble. Maintenant chaque ecran n'alloue que ce dont il a besoin (liberation avant allocation).
+static void uiSwitchSprites(Screen s) {
+  if (s == SCR_PLAY) {
+    endModernDashboard();                                          // -29 Ko
+    if (!barSpr.created())   barSpr.createSprite(BAR_W, BAR_H);    // le plus gros d'abord (moins de fragmentation)
+    if (!titleSpr.created()) titleSpr.createSprite(COL_W, TITLE_H);
+    if (!barSpr.created() || !titleSpr.created()) Serial.println("[ui] RAM insuffisante pour les sprites de lecture");
+  } else if (s == SCR_WAIT) {
+    if (barSpr.created())   barSpr.deleteSprite();                 // -34 Ko
+    if (titleSpr.created()) titleSpr.deleteSprite();
+    if (!modernDashboardReady() && !initModernDashboard()) Serial.println("[ui] RAM insuffisante pour le dashboard");
+  } else {
+    return;
+  }
+  Serial.printf("[ui] ecran %d : heap libre %u, plus grand bloc %u\n", (int)s, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+}
+
+// Pre-reserve les String longue duree au demarrage, tant que le heap est sain : les affectations suivantes
+// reutilisent le meme bloc au lieu de malloc/free a chaque piste ou chaque actu (source n°1 de fragmentation).
+static void reserveStrings() {
+  np.title.reserve(96); np.artist.reserve(64); np.album.reserve(64); np.coverId.reserve(24);
+  np.app.reserve(24); np.appId.reserve(40);
+  np.lyric.reserve(160); np.lyricPrev.reserve(160); np.lyricNext.reserve(160);
+  coverIdStored.reserve(24); iconIdStored.reserve(40); bigIdStored.reserve(24);
+  for (int i = 0; i < 8; i++) {
+    idleData.news[i].reserve(112);
+    idleData.newsMeta[i].desc.reserve(NEWS_DESC_MAX);
+    idleData.newsMeta[i].when.reserve(14);
+    idleData.newsMeta[i].src.reserve(32);
   }
 }
 
@@ -2462,25 +3278,23 @@ void setup() {
   TJpgDec.setJpgScale(1);
   TJpgDec.setCallback(tftOutput);
 
-  coverBuf = (uint8_t*)malloc(COVER_MAX_BYTES);
+  reserveStrings();                                // d'abord les petits blocs durables...
+  coverBuf = (uint8_t*)malloc(COVER_MAX_BYTES);    // ...puis les buffers d'images permanents
   iconBuf  = (uint8_t*)malloc(ICON_MAX_BYTES);
-  bigBuf   = (uint8_t*)malloc(BIG_MAX_BYTES);    // pochette HD (peut rester nul si la memoire manque)
-  titleSpr.createSprite(COL_W, TITLE_H);
-  barSpr.createSprite(BAR_W, BAR_H);
-  eqSpr.createSprite(100, 72);
-  if (!initModernDashboard()) Serial.println("[ui] RAM insuffisante pour les sprites du dashboard");
+  // v1.8 : sprites (uiSwitchSprites) et pochette HD (bigEnsure) alloues a la demande
   Serial.printf("[ui] heap libre apres sprites: %u (max bloc %u)\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/nowplaying", HTTP_POST, handleNowPlaying);
-  server.on("/api/cover", HTTP_POST, handleCover);
-  server.on("/api/icon", HTTP_POST, handleIcon);
-  server.on("/api/coverbig", HTTP_POST, handleBigCover);
+  server.on("/api/cover", HTTP_POST, handleCover, uploadCover);
+  server.on("/api/icon", HTTP_POST, handleIcon, uploadIcon);
+  server.on("/api/coverbig", HTTP_POST, handleBigCover, uploadBig);
   server.on("/api/pcstats", HTTP_POST, handlePcStats);
   server.on("/api/sdclear", HTTP_POST, handleSdClear);
   server.on("/api/config", HTTP_GET, sendConfig);
   server.on("/api/config", HTTP_POST, handleConfigPost);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/diag", HTTP_GET, handleDiag);        // v1.8
   server.on("/api/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/api/idle", HTTP_POST, handleIdle);
   server.on("/api/idleconfig", HTTP_GET,  handleGetIdleConfig);
@@ -2491,6 +3305,7 @@ void setup() {
   server.onNotFound(handleNotFound);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);              // v1.8 : desactive le modem-sleep (+100-300 ms de latence sur CHAQUE requete HTTP)
   WiFi.setHostname(HOSTNAME);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
@@ -2517,8 +3332,9 @@ void setup() {
   if (wifiSsid.length() == 0) {
     startPortal();                       // premiere utilisation : portail de configuration
   } else {
-    uint8_t bssid[6];
-    int ch = scanFor24GHz(bssid);
+    uint8_t bssid[6]; int ch = 0;
+    if (wifiFastLoad(bssid, &ch)) Serial.printf("[wifi] connexion rapide (AP memorise) ch%d\n", ch);   // v1.8 : pas de scan
+    else                          ch = scanFor24GHz(bssid);
     if (ch > 0) {
       Serial.printf("[wifi] demarrage sur BSSID 2.4 GHz ch%d\n", ch);
       WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), ch, bssid);
@@ -2529,14 +3345,22 @@ void setup() {
   }
 }
 
+// v1.8 : trace ce qui bloque la boucle (donc le tactile) plus de 100 ms
+static inline void slowLog(const char* what, uint32_t t0) {
+  const uint32_t d = millis() - t0;
+  if (d >= 100) Serial.printf("[loop] %s a bloque %u ms (le tactile n'a pas ete lu pendant ce temps)\n", what, (unsigned)d);
+}
+
 void loop() {
-  wifiTask();
+  uint32_t t0 = millis();
+  wifiTask();                      slowLog("wifiTask", t0);
   if (portalActive) dnsServer.processNextRequest();
-  tickNetFetch();
-  if (serverStarted) server.handleClient();
+  t0 = millis(); tickNetFetch();   slowLog("meteo (fetch)", t0);
+  t0 = millis(); if (serverStarted) server.handleClient(); slowLog("serveur HTTP", t0);
   pollViz();
   tickLdr();
   tickLed();
+  diag::tick();                    // echantillon heap toutes les 5 s + alertes fragmentation / fuite
 
   Screen want;
   if (WiFi.status() != WL_CONNECTED) {
@@ -2552,12 +3376,14 @@ void loop() {
   }
 
   // Ne pas ecraser les ecrans detail (meteo/news plein format)
-  bool onDetailScreen = (cur == SCR_IDLE_WX || cur == SCR_IDLE_NEWS || cur == SCR_MENU || cur == SCR_IDLE_PC);
+  bool onDetailScreen = (cur == SCR_IDLE_WX || cur == SCR_IDLE_NEWS || cur == SCR_MENU || cur == SCR_IDLE_PC || cur == SCR_SYS);
   if (!onDetailScreen && want != cur) {
     cur = want;
     lastClockMin = -1;   // force le redessin de l'heure au changement d'ecran
     fullCover = false;   // quitter le mode fullCover si on change d'ecran
     vizMode = false; lyricFull = false;
+    bigRelease();        // v1.8 : la pochette HD n'est utile qu'en plein ecran
+    uiSwitchSprites(cur);   // v1.8 : sprites alloues selon l'ecran
     idleDrawn = false;   // forcer redessin de l'ecran idle
     if (cur == SCR_PLAY) drawMusicScreen();
     else if (cur == SCR_WIFI) drawWaitScreen(true);
@@ -2581,8 +3407,9 @@ void loop() {
   } else if (cur == SCR_WAIT) {
     handleTouch();   // on garde le touch actif pour reset auto-dim
     if (cur == SCR_WAIT) animateIdle();   // sinon les sprites de l'accueil se repoussent sur la page actus/meteo
-  } else if (cur == SCR_IDLE_WX || cur == SCR_IDLE_NEWS || cur == SCR_MENU || cur == SCR_IDLE_PC) {
+  } else if (cur == SCR_IDLE_WX || cur == SCR_IDLE_NEWS || cur == SCR_MENU || cur == SCR_IDLE_PC || cur == SCR_SYS) {
     handleTouch();   // tap = retour idle
+    tickSysScreen();                     // v1.8 : rafraichit l'ecran Systeme (1 Hz)
     if (cur == SCR_IDLE_PC) {            // page "Mon PC" : redessin a chaque nouvelle mesure (ou quand elle devient perimee)
       static bool wasFresh = true;
       bool f = pcsFresh();
