@@ -1,0 +1,5 @@
+#pragma once
+// Copie ce fichier en config.h et renseigne tes valeurs (NE PAS publier config.h)
+#define WIFI_SSID  "ton_ssid"
+#define WIFI_PASS  "ton_mot_de_passe"
+#define OTA_TOKEN  "un_token_long_et_aleatoire"
