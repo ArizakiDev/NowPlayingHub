@@ -33,6 +33,8 @@ public class LyricsService
 
     string _key = "";
     volatile List<(double T, string Text)>? _lines;
+    public string LastSource { get; private set; } = "";     // source qui a fourni les paroles de la piste en cours
+    public int LineCount => _lines?.Count ?? 0;
     readonly Dictionary<string, List<(double, string)>> _cache = new();
 
     public LyricsService(AppConfig cfg)
@@ -42,24 +44,30 @@ public class LyricsService
     }
 
     /// <summary>Ligne a afficher maintenant (chaine vide si pas de paroles).</summary>
-    public string Line(Snapshot snap)
+    public string Line(Snapshot snap) => Context(snap).Cur;
+
+    /// <summary>Ligne precedente, en cours et suivante (pour l'affichage plein ecran des paroles).</summary>
+    public (string Prev, string Cur, string Next) Context(Snapshot snap)
     {
         if (snap.Key != _key)
         {
             _key = snap.Key;
             _lines = null;
+            LastSource = "";
             var key = _key;
             _ = Task.Run(() => LoadAsync(snap, key));
         }
         var ls = _lines;
-        if (ls == null || ls.Count == 0) return "";
-        double p = snap.Position + 0.4;   // petite avance pour compenser la latence
-        string cur = "";
-        foreach (var (t, s) in ls)
-        {
-            if (t <= p) cur = s; else break;
-        }
-        return cur;
+        if (ls == null || ls.Count == 0) return ("", "", "");
+        // petite avance pour compenser la latence + decalage reglable depuis le panel
+        double p = snap.Position + 0.4 + _cfg.LyricsOffsetMs / 1000.0;
+        int idx = -1;
+        for (int i = 0; i < ls.Count; i++) { if (ls[i].T <= p) idx = i; else break; }
+        string cur = idx >= 0 ? ls[idx].Text : "";
+        string prev = "", next = "";
+        for (int i = idx - 1; i >= 0 && i >= idx - 3; i--) if (ls[i].Text.Length > 0) { prev = ls[i].Text; break; }
+        for (int i = idx + 1; i < ls.Count && i <= idx + 3; i++) if (ls[i].Text.Length > 0) { next = ls[i].Text; break; }
+        return (prev, cur, next);
     }
 
     async Task LoadAsync(Snapshot snap, string key)
@@ -83,12 +91,18 @@ public class LyricsService
                 var lrc = await fn(snap, cts.Token);
                 if (string.IsNullOrWhiteSpace(lrc)) continue;
                 var parsed = Parse(lrc);
-                if (parsed.Count >= 3)
+                if (parsed.Count < 3) continue;
+                // L'ecran de la carte n'affiche que de l'ASCII : on passe a la source suivante si les paroles sont en
+                // alphabet non latin (chinois, coreen, cyrillique...), qui s'afficheraient en "????".
+                if (_cfg.AsciiOnly && !MostlyLatin(parsed))
                 {
-                    result = parsed;
-                    Log.Write($"paroles: {name} ({parsed.Count} lignes)");
-                    break;
+                    Log.Write($"paroles {name}: ignorees (alphabet non affichable)");
+                    continue;
                 }
+                result = parsed;
+                LastSource = name;
+                Log.Write($"paroles: {name} ({parsed.Count} lignes)");
+                break;
             }
             catch (Exception e) { Log.Write($"paroles {name}: {e.Message}"); }
         }
@@ -288,6 +302,20 @@ public class LyricsService
     {
         string a = Norm(wanted), b = Norm(found);
         return a.Length > 0 && b.Length > 0 && (b.Contains(a) || a.Contains(b));
+    }
+
+    // true si au moins 60 % des lettres sont de l'alphabet latin (accents compris)
+    static bool MostlyLatin(List<(double, string)> lines)
+    {
+        int letters = 0, latin = 0;
+        foreach (var (_, text) in lines)
+            foreach (var ch in text)
+            {
+                if (!char.IsLetter(ch)) continue;
+                letters++;
+                if (ch < 0x250 || (ch >= 0x1E00 && ch <= 0x1EFF)) latin++;
+            }
+        return letters == 0 || latin >= letters * 0.6;
     }
 
     static List<(double, string)> Parse(string lrc)

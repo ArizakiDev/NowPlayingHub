@@ -26,16 +26,29 @@ public class SyncService
     byte[]? _iconJpeg;
 
     readonly LyricsService _lyrics;
+    public LyricsService Lyrics => _lyrics;
+    public readonly SpectrumService Spectrum;
+    public readonly PcStatsService PcStats = new();
+    DateTime _lastPcPush = DateTime.MinValue;
+
+    // Pochette plein ecran 240x240, produite a la demande
+    byte[]? _rawCover;
+    string _bigKey = "";
+    byte[]? _bigJpeg;
+    int _bigTries;
     string _accentKey = "";
     string? _accent;
 
     DateTime _lastIdlePush    = DateTime.MinValue;
+    List<NewsItem>? _lastPushedNews = null;  // v1.8 : pousse les actus des qu'elles changent (et plus seulement toutes les 5 min)
     WeatherData? _lastPushedWeather = null;  // detecte si la meteo a change
 
     public SyncService(AppConfig cfg, MediaService media, EspClient esp, Updater upd, IdleService idle)
     {
         _cfg = cfg; _media = media; _esp = esp; _upd = upd; _idle = idle;
         _lyrics = new LyricsService(cfg);
+        Spectrum = new SpectrumService(cfg);
+        PcStats.Start();
     }
 
     static string Hash(string s) =>
@@ -68,14 +81,31 @@ public class SyncService
     /// <summary>Pochette 120x120 de la piste (mise en cache par piste).</summary>
     public async Task<byte[]?> GetCoverAsync(string key)
     {
-        if (_coverKey != key) { _coverKey = key; _coverJpeg = null; _coverTries = 0; }
+        if (_coverKey != key) { _coverKey = key; _coverJpeg = null; _coverTries = 0; _rawCover = null; }
         if (_coverJpeg == null && _coverTries < 4)
         {
             _coverTries++;
             var raw = await _media.GetThumbnailAsync();
-            if (raw != null) _coverJpeg = await Images.CoverJpegAsync(raw, 120, 15000);
+            if (raw != null)
+            {
+                _rawCover = raw;
+                _coverJpeg = await Images.CoverJpegAsync(raw, 120, 11000); // v1.8 : 15000 -> 11000 (buffer ESP32 12 Ko, transfert plus court)
+            }
         }
         return _coverJpeg;
+    }
+
+    /// <summary>Pochette 240x240 (plein ecran), a la demande ; 3 essais max par piste.</summary>
+    async Task<byte[]?> GetBigCoverAsync(string key)
+    {
+        if (_bigKey != key) { _bigKey = key; _bigJpeg = null; _bigTries = 0; }
+        if (_bigJpeg == null && _bigTries < 3)
+        {
+            _bigTries++;
+            var raw = (_coverKey == key ? _rawCover : null) ?? await _media.GetThumbnailAsync();
+            if (raw != null) _bigJpeg = await Images.CoverJpegAsync(raw, 240, 20000);
+        }
+        return _bigJpeg;
     }
 
     public Task<bool> RunCommandAsync(string cmd) => _media.CommandAsync(cmd);
@@ -134,7 +164,12 @@ public class SyncService
                 }
                 accent = _accentKey == key ? _accent : null;
             }
-            string lyric = _cfg.Esp.ShowLyrics ? Clean(_lyrics.Line(snap)) : "";
+            string lyric = "", lyricPrev = "", lyricNext = "";
+            if (_cfg.Esp.ShowLyrics)
+            {
+                var (lp, lc, ln) = _lyrics.Context(snap);
+                lyric = Clean(lc); lyricPrev = Clean(lp); lyricNext = Clean(ln);
+            }
 
             json = JsonSerializer.Serialize(new
             {
@@ -148,7 +183,9 @@ public class SyncService
                 app = Clean(snap.AppName),
                 appId = Hash(snap.AppId),
                 accent,
-                lyric
+                lyric,
+                lyricPrev,
+                lyricNext
             });
         }
 
@@ -159,18 +196,31 @@ public class SyncService
 
         if (!EspOnline) { EspOnline = true; LastError = ""; await OnConnectedAsync(); }
 
+        // Spectre audio : la carte dit (reponse) quand elle l'affiche ; sinon la capture est arretee
+        Spectrum.Request(_cfg.Visualizer && rep.Viz, EspIp);
+
+        // Stats du PC pour l'ecran de veille (uniquement quand rien ne joue)
+        if (_cfg.ShowPcStats && (snap == null || snap.State != "playing")
+            && (DateTime.UtcNow - _lastPcPush).TotalSeconds >= 3 && PcStats.Latest is { } pcs)
+        {
+            _lastPcPush = DateTime.UtcNow;
+            try { await _esp.PostPcStatsAsync(pcs); }
+            catch (Exception e) { Log.Write("pcstats: " + e.Message); }
+        }
+
         // Envoyer les donnees idle :
         //  - immediatement si la meteo vient de changer (premiere fois ou refresh)
         //  - sinon toutes les 5 min pour garder l'ESP a jour (news, etc.)
         var currentWeather = _idle.Weather;
-        bool weatherChanged = currentWeather != _lastPushedWeather;
+        bool weatherChanged = currentWeather != _lastPushedWeather || !ReferenceEquals(_idle.NewsItems, _lastPushedNews);
         bool timeDue = (DateTime.UtcNow - _lastIdlePush).TotalMinutes >= 5;
         if (weatherChanged || timeDue || _lastIdlePush == DateTime.MinValue)
         {
             try
             {
-                bool sent = await _esp.PostIdleAsync(currentWeather, _idle.Headlines);
-                if (sent) { _lastIdlePush = DateTime.UtcNow; _lastPushedWeather = currentWeather; }
+                var newsNow = _idle.NewsItems;
+                bool sent = await _esp.PostIdleAsync(currentWeather, _idle.Headlines, newsNow);
+                if (sent) { _lastIdlePush = DateTime.UtcNow; _lastPushedWeather = currentWeather; _lastPushedNews = newsNow; }
             }
             catch (Exception e) { Log.Write("idle push: " + e.Message); }
         }
@@ -181,6 +231,11 @@ public class SyncService
             {
                 var jpg = await GetCoverAsync(key);
                 if (jpg != null) await _esp.PostCoverAsync(coverId, jpg);
+            }
+            if (rep.NeedBig && snap != null)
+            {
+                var big = await GetBigCoverAsync(key);
+                if (big != null) await _esp.PostBigCoverAsync(coverId, big);
             }
             if (rep.NeedIcon && snap != null)
             {

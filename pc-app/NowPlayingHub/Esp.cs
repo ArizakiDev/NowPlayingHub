@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace NowPlayingHub;
 
-public record EspReply(bool NeedCover, bool NeedIcon, string? Cmd);
+public record EspReply(bool NeedCover, bool NeedIcon, string? Cmd, bool NeedBig = false, bool Viz = false);
 public record EspStatus(string Version, string Ip);
 
 /// <summary>Contenu HTTP envoye par blocs pour suivre la progression de l'upload du firmware.</summary>
@@ -37,6 +37,9 @@ public class EspClient
     readonly AppConfig _cfg;
     readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(3) };
     readonly HttpClient _long = new() { Timeout = TimeSpan.FromMinutes(3) };
+    // v1.8 : les images (base64 ~20-27 Ko) peuvent arriver pendant que l'ESP32 est occupe (dessin, SD) : 3 s etait trop court
+    // et le PC abandonnait en cours de corps -> l'ESP voyait un POST tronque. 10 s laissent le temps sans bloquer la synchro.
+    readonly HttpClient _img = new() { Timeout = TimeSpan.FromSeconds(10) };
     public EspClient(AppConfig cfg) { _cfg = cfg; }
 
     string Base => $"http://{_cfg.EspHost}";
@@ -52,18 +55,55 @@ public class EspClient
         using var doc = JsonDocument.Parse(await r.Content.ReadAsStringAsync());
         var e = doc.RootElement;
         string? cmd = e.TryGetProperty("cmd", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null;
-        return new EspReply(Bool(e, "needCover"), Bool(e, "needIcon"), cmd);
+        return new EspReply(Bool(e, "needCover"), Bool(e, "needIcon"), cmd, Bool(e, "needBig"), Bool(e, "viz"));
     }
 
     async Task<bool> PostBase64Async(string path, string id, byte[] jpeg)
     {
-        using var content = new StringContent(Convert.ToBase64String(jpeg), Encoding.ASCII, "text/plain");
-        using var r = await _http.PostAsync($"{Base}{path}?id={Uri.EscapeDataString(id)}", content);
+        // v1.8 : envoi BINAIRE en multipart (comme la mise a jour OTA) : -25 % de donnees et, surtout, l'ESP32 ecrit chaque
+        // fragment directement dans son buffer au lieu de stocker 2 a 3 copies base64 de 20-27 Ko en RAM contigue.
+        // Necessite le firmware >= 1.8 (nom de methode conserve pour ne pas toucher aux appelants).
+        const string boundary = "NPHimg5c1e47";
+        using var form = new MultipartFormDataContent(boundary);
+        // Boundary SANS guillemets : le WebServer de l'ESP32 ne sait pas les retirer (meme astuce que pour l'OTA)
+        form.Headers.ContentType = MediaTypeHeaderValue.Parse("multipart/form-data; boundary=" + boundary);
+        var part = new ByteArrayContent(jpeg);
+        part.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+        form.Add(part, "file", "img.jpg");
+        using var r = await _img.PostAsync($"{Base}{path}?id={Uri.EscapeDataString(id)}", form);
         return r.IsSuccessStatusCode;
     }
 
     public Task<bool> PostCoverAsync(string id, byte[] jpeg) => PostBase64Async("/api/cover", id, jpeg);
     public Task<bool> PostIconAsync(string id, byte[] jpeg) => PostBase64Async("/api/icon", id, jpeg);
+    public Task<bool> PostBigCoverAsync(string id, byte[] jpeg) => PostBase64Async("/api/coverbig", id, jpeg);
+
+    async Task<bool> PostJsonAsync(string path, object payload)
+    {
+        using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var r = await _http.PostAsync(Base + path, content);
+        return r.IsSuccessStatusCode;
+    }
+
+    /// <summary>Stats du PC pour l'ecran de veille de la carte.</summary>
+    public Task<bool> PostPcStatsAsync(PcStatsSample s) => PostJsonAsync("/api/pcstats", new
+    {
+        cpu = s.Cpu, ram = s.Ram, disk = s.Disk,
+        ramUsed = Math.Round(s.RamUsed, 1), ramTotal = Math.Round(s.RamTotal, 1), diskFree = Math.Round(s.DiskFree, 0),
+        down = s.DownKBs, up = s.UpKBs, uptime = s.UptimeMin
+    });
+
+    /// <summary>Calibration du capteur de lumiere : "dark" ou "bright" (la carte memorise la valeur actuelle).</summary>
+    public Task<bool> CalibrateLdrAsync(string which) => PostJsonAsync("/api/config", new { ldrCal = which });
+
+    public Task<bool> ClearSdAsync() => PostJsonAsync("/api/sdclear", new { });
+
+    /// <summary>JSON brut de /api/status (page de statut).</summary>
+    public async Task<string?> GetStatusJsonAsync()
+    {
+        using var r = await _http.GetAsync(Base + "/api/status");
+        return r.IsSuccessStatusCode ? await r.Content.ReadAsStringAsync() : null;
+    }
 
     public async Task<EspStatus?> GetStatusAsync()
     {
@@ -90,7 +130,13 @@ public class EspClient
             nightEnd = c.NightModeEnd,
             nightBri = c.NightBrightness,
             dimMin = c.DimAfterMinutes,
-            dimBri = c.DimBrightness
+            dimBri = c.DimBrightness,
+            autoBri = s.AutoBrightness,
+            ledMode = s.LedMode,
+            ledBri = s.LedBrightness,
+            ledNightOff = s.LedNightOff,
+            sdCache = s.SdCache,
+            sdMax = s.SdMax
         });
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var r = await _http.PostAsync(Base + "/api/config", content);
@@ -98,7 +144,7 @@ public class EspClient
     }
 
     /// <summary>Envoie les donnees de l'ecran de veille (meteo + news) a l'ESP32.</summary>
-    public async Task<bool> PostIdleAsync(WeatherData? weather, List<string> headlines)
+    public async Task<bool> PostIdleAsync(WeatherData? weather, List<string> headlines, List<NewsItem>? items = null)
     {
         var payload = new
         {
@@ -113,7 +159,8 @@ public class EspClient
             sunrise     = weather?.Sunrise ?? "",
             sunset      = weather?.Sunset ?? "",
             hasWeather  = weather != null,
-            news        = headlines.Take(8).ToArray()
+            news        = (items == null || items.Count == 0) ? headlines.Take(8).ToArray() : Array.Empty<string>(),   // titres seuls : uniquement si pas de details (firmware < 1.8) ; evite de doubler le JSON
+            newsItems   = (items ?? new List<NewsItem>()).Take(8).Select(i => new { t = i.Title, d = i.Desc, p = i.When, s = i.Source }).ToArray()
         };
         var json = JsonSerializer.Serialize(payload);
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
