@@ -131,6 +131,7 @@ class Dashboard {
 
   // À appeler une fois après tft.init()/setRotation(1). false si RAM insuffisante.
   bool begin() {
+    if (ready) return true;                       // idempotent (v1.8)
     tkSpr.setColorDepth(16);
     timeSpr.setColorDepth(16);
     ready = tkSpr.createSprite(TK_SPR_W, TK_SPR_H) &&
@@ -138,6 +139,10 @@ class Dashboard {
     invalidate();
     return ready;
   }
+
+  // v1.8 : libere les sprites (~29 Ko) quand l'accueil n'est pas affiche ; begin() les recree
+  void end() { if (ready) { tkSpr.deleteSprite(); timeSpr.deleteSprite(); ready = false; } }
+  bool isReady() const { return ready; }
 
   // Force un redessin complet au prochain update() (retour d'un autre écran)
   void invalidate() {
@@ -354,6 +359,8 @@ extern TFT_eSPI tft;                       // ton instance globale existante
 static ui::Dashboard g_dashboard(tft);
 
 inline bool initModernDashboard()                        { return g_dashboard.begin(); }
+inline void endModernDashboard()                         { g_dashboard.end(); }
+inline bool modernDashboardReady()                       { return g_dashboard.isReady(); }
 inline void invalidateModernDashboard()                  { g_dashboard.invalidate(); }
 inline void drawModernDashboard(const ui::DashboardData& d) { g_dashboard.update(d, millis()); }
 

@@ -36,5 +36,5 @@
 #define LOAD_FONT7
 #define LOAD_GFXFF            // polices FreeSans/FreeSansBold (dashboard v1.7)
 
-#define SPI_FREQUENCY       40000000
+#define SPI_FREQUENCY       55000000   // v1.8 : 40 -> 55 MHz (-27 % de temps d'affichage). Si artefacts : revenir a 40000000
 #define SPI_READ_FREQUENCY  20000000

@@ -5,7 +5,7 @@
 #ifdef FW_VERSION
 #undef FW_VERSION
 #endif
-#define FW_VERSION        "1.6.0"
+#define FW_VERSION        "1.8.0"
 
 #ifndef HOSTNAME
 #define HOSTNAME          "nowplaying"   // http://nowplaying.local
@@ -20,7 +20,7 @@
 #define PAUSE_TO_IDLE_MS  30000          // apres X ms en pause -> ecran idle
 #endif
 #ifndef COVER_MAX_BYTES
-#define COVER_MAX_BYTES   16384
+#define COVER_MAX_BYTES   12288          // v1.8 : 16384 -> 12288 (le PC compresse a <= 11000 o)
 #endif
 #ifndef ICON_MAX_BYTES
 #define ICON_MAX_BYTES    4096
