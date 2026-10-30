@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Statut - Now Playing Hub</title>
+<style>
+:root{--bg:#0e0e14;--card:#171722;--line:#262636;--text:#f2f2f6;--dim:#8d8da0;--acc:#fa2d48;--ok:#35d07f;--bad:#ff5c5c;--warn:#ffb020}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:18px 24px;border-bottom:1px solid var(--line)}
+header h1{font-size:18px;margin:0;flex:1}
+a{color:var(--text);text-decoration:none}
+.pill{padding:4px 12px;border-radius:99px;font-size:12px;background:var(--line);color:var(--dim)}
+.pill.ok{background:rgba(53,208,127,.15);color:var(--ok)}.pill.bad{background:rgba(255,92,92,.15);color:var(--bad)}.pill.warn{background:rgba(255,176,32,.15);color:var(--warn)}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;padding:20px 24px;max-width:1200px;margin:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.card h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:0 0 12px;display:flex;justify-content:space-between;align-items:center}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-top:1px solid var(--line)}
+.kv:first-of-type{border-top:0}
+.kv span:first-child{color:var(--dim)}
+.kv span:last-child{text-align:right;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.meter{height:6px;background:#2a2a3a;border-radius:3px;margin:2px 0 8px;overflow:hidden}
+.meter>i{display:block;height:100%;background:var(--acc);width:0;transition:width .4s}
+.meter>i.hot{background:var(--bad)}
+.spark{width:100%;height:46px;margin-top:6px}
+.spark polyline{fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke}
+.cap{font-size:11px;color:var(--dim);display:flex;justify-content:space-between}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--dim)}
+.dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Statut</h1>
+  <span id="espPill" class="pill">ESP32 ...</span>
+  <a class="pill" href="/">&larr; Panneau</a>
+</header>
+<main>
+
+<section class="card"><h2>Carte ESP32</h2>
+  <div class="kv"><span>État</span><span id="eState">-</span></div>
+  <div class="kv"><span>Firmware</span><span id="eFw">-</span></div>
+  <div class="kv"><span>Adresse</span><span id="eIp">-</span></div>
+  <div class="kv"><span>Écran affiché</span><span id="eScreen">-</span></div>
+  <div class="kv"><span>Allumée depuis</span><span id="eUp">-</span></div>
+  <div class="kv"><span>Wi-Fi (RSSI)</span><span id="eRssi">-</span></div>
+  <div class="kv"><span>Mémoire libre</span><span id="eHeap">-</span></div>
+  <div class="kv"><span>Température de la puce</span><span id="eTemp">-</span></div>
+  <div class="cap"><span>Mémoire libre (min. 2 min)</span><span id="hCap"></span></div>
+  <svg class="spark" id="sHeap" viewBox="0 0 120 40" preserveAspectRatio="none"><polyline points=""/></svg>
+  <div class="cap"><span>Signal Wi-Fi</span><span id="rCap"></span></div>
+  <svg class="spark" id="sRssi" viewBox="0 0 120 40" preserveAspectRatio="none"><polyline points=""/></svg>
+</section>
+
+<section class="card"><h2>En lecture</h2>
+  <div class="kv"><span>Morceau</span><span id="nTitle">-</span></div>
+  <div class="kv"><span>Artiste</span><span id="nArtist">-</span></div>
+  <div class="kv"><span>Appli suivie</span><span id="nApp">-</span></div>
+  <div class="kv"><span>Lecture</span><span id="nState">-</span></div>
+  <div class="kv"><span>Paroles</span><span id="nLyr">-</span></div>
+  <div class="kv"><span>Pochette HD sur la carte</span><span id="nBig">-</span></div>
+</section>
+
+<section class="card"><h2>Lumière et LED</h2>
+  <div class="kv"><span>Luminosité réglée</span><span id="lBri">-</span></div>
+  <div class="kv"><span>Mode automatique</span><span id="lAuto">-</span></div>
+  <div class="kv"><span>Mode nuit</span><span id="lNight">-</span></div>
+  <div class="kv"><span>Capteur de lumière</span><span id="lLdr">-</span></div>
+  <div class="kv"><span>LED RGB</span><span id="lLed">-</span></div>
+  <div class="cap"><span>Capteur de lumière (brut)</span><span id="lCap"></span></div>
+  <svg class="spark" id="sLdr" viewBox="0 0 120 40" preserveAspectRatio="none"><polyline points=""/></svg>
+</section>
+
+<section class="card"><h2>Spectre et carte SD</h2>
+  <div class="kv"><span>Capture du son (PC)</span><span id="vRun">-</span></div>
+  <div class="kv"><span>Paquets envoyés</span><span id="vPc">-</span></div>
+  <div class="kv"><span>Paquets reçus (carte)</span><span id="vEsp">-</span></div>
+  <div class="kv"><span>Visualiseur côté carte</span><span id="vLive">-</span></div>
+  <div class="kv"><span>Carte SD</span><span id="sdState">-</span></div>
+  <div class="kv"><span>Pochettes en cache</span><span id="sdFiles">-</span></div>
+</section>
+
+<section class="card"><h2>PC <span id="pcUp"></span></h2>
+  <div class="kv"><span>Processeur</span><span id="pCpu">-</span></div>
+  <div class="meter"><i id="mCpu"></i></div>
+  <div class="kv"><span>Mémoire</span><span id="pRam">-</span></div>
+  <div class="meter"><i id="mRam"></i></div>
+  <div class="kv"><span>Disque système</span><span id="pDisk">-</span></div>
+  <div class="meter"><i id="mDisk"></i></div>
+  <div class="kv"><span>Réseau</span><span id="pNet">-</span></div>
+</section>
+
+<section class="card"><h2>Appli PC</h2>
+  <div class="kv"><span>Version</span><span id="aVer">-</span></div>
+  <div class="kv"><span>En marche depuis</span><span id="aUp">-</span></div>
+  <div class="kv"><span>Adresse de la carte</span><span id="aHost">-</span></div>
+  <div class="kv"><span>Dernière erreur</span><span id="aErr">-</span></div>
+</section>
+
+</main>
+<script>
+const $=id=>document.getElementById(id);
+async function get(p){try{const r=await fetch(p);return await r.json()}catch{return null}}
+const dur=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+' j ':'')+(h||d?h+' h ':'')+m+' min'};
+const rate=k=>k>=1024?(k/1024).toFixed(1)+' Mo/s':k+' Ko/s';
+const set=(id,t,cls)=>{const e=$(id);if(!e)return;e.textContent=t;};
+const dot=(ok,t)=>'<i class="dot '+(ok===true?'ok':ok===false?'bad':'warn')+'"></i>'+t;
+const hist={heap:[],rssi:[],ldr:[]};
+function push(k,v){if(typeof v!=='number'||isNaN(v))return;hist[k].push(v);if(hist[k].length>60)hist[k].shift()}
+function spark(id,arr){
+  const pl=$(id).querySelector('polyline');
+  if(arr.length<2){pl.setAttribute('points','');return}
+  const lo=Math.min(...arr),hi=Math.max(...arr),rg=Math.max(1,hi-lo);
+  pl.setAttribute('points',arr.map((v,i)=>(i*120/(arr.length-1)).toFixed(1)+','+(38-(v-lo)/rg*36).toFixed(1)).join(' '));
+}
+function meter(id,p){const e=$(id);e.style.width=Math.min(100,p)+'%';e.className=p>=90?'hot':''}
+
+async function tick(){
+  const [st,es]=await Promise.all([get('/api/state'),get('/api/esp-status')]);
+  if(st){
+    $('aVer').textContent='v'+st.appVersion;
+    $('aUp').textContent=dur(st.appUptime);
+    $('aHost').textContent=st.esp.host;
+    $('aErr').textContent=st.esp.error||'aucune';
+    const n=st.now;
+    $('nTitle').textContent=n?n.title:'-';$('nArtist').textContent=n?(n.artist||'-'):'-';
+    $('nApp').textContent=n?(n.app||'-'):'-';
+    $('nState').textContent=n?n.state:'rien';
+    const ly=st.lyrics||{};
+    $('nLyr').textContent=ly.lines?('oui : '+ly.source+' ('+ly.lines+' lignes)'):'aucune trouvée';
+    const sp=st.spectrum||{};
+    $('vRun').innerHTML=sp.running?dot(true,'en cours'):dot(null,'arrêtée (inactive)');
+    $('vPc').textContent=(sp.packets??'-')+(sp.error?'  ('+sp.error+')':'');
+    const pc=st.pc;
+    if(pc){
+      $('pCpu').textContent=pc.cpu+' %';meter('mCpu',pc.cpu);
+      $('pRam').textContent=pc.ramUsed.toFixed(1)+' / '+pc.ramTotal.toFixed(1)+' Go ('+pc.ram+' %)';meter('mRam',pc.ram);
+      $('pDisk').textContent=pc.diskFree.toFixed(0)+' Go libres ('+pc.disk+' % utilisé)';meter('mDisk',pc.disk);
+      $('pNet').textContent='↓ '+rate(pc.downKBs)+'   ↑ '+rate(pc.upKBs);
+      $('pcUp').textContent='allumé depuis '+dur(pc.uptimeMin*60);
+    }
+  }
+  const pill=$('espPill');
+  if(es&&es.online){
+    const e=es.status;
+    pill.className='pill ok';pill.textContent='ESP32 connecté';
+    $('eState').innerHTML=dot(true,'en ligne');
+    $('eFw').textContent='v'+e.version;$('eIp').textContent=e.ip;
+    const names={play:'Lecture',cover:'Pochette plein écran',viz:'Visualiseur',lyrics:'Paroles en grand',idle:'Veille',weather:'Météo',news:'Actualités',pc:'Mon PC',menu:'Menu',wifi:'Configuration Wi-Fi'};
+    $('eScreen').textContent=names[e.screen]||e.screen;
+    $('eUp').textContent=dur(e.uptime);
+    const q=e.rssi>=-60?'excellent':e.rssi>=-70?'bon':e.rssi>=-80?'moyen':'faible';
+    $('eRssi').textContent=e.rssi+' dBm ('+q+')';
+    $('eHeap').textContent=(e.heap/1024).toFixed(0)+' Ko (bloc max '+(e.maxAlloc/1024).toFixed(0)+' Ko)';
+    $('eTemp').textContent=e.chipTemp!=null?e.chipTemp.toFixed(0)+' °C (indicatif)':'-';
+    push('heap',e.heap/1024);push('rssi',e.rssi);push('ldr',e.ldrRaw);
+    $('hCap').textContent=(e.heap/1024).toFixed(0)+' Ko';$('rCap').textContent=e.rssi+' dBm';$('lCap').textContent=e.ldrRaw;
+    $('lBri').textContent=e.brightnessPct+' %';
+    $('lAuto').textContent=e.autoBri?'activé':'désactivé';
+    $('lNight').textContent=e.night?'oui (écran atténué)':'non';
+    $('lLdr').textContent=e.ldrRaw+' (≈ '+e.ldrLight+' % de lumière)';
+    $('lLed').textContent=['éteinte','couleur d\'accent','pulsation','suit les basses'][e.ledMode]||'-';
+    $('nBig').textContent=e.bigCover?'oui':'non (chargée à la demande)';
+    $('vEsp').textContent=e.vizPackets;
+    $('vLive').innerHTML=e.viz?dot(true,'reçoit le spectre'):dot(null,'pas de signal');
+    const sd=e.sd||{};
+    $('sdState').innerHTML=!sd.enabled?dot(null,'cache désactivé'):sd.ok?dot(true,'détectée ('+sd.sizeMB+' Mo)'):dot(false,'aucune carte');
+    $('sdFiles').textContent=sd.ok?sd.files:'-';
+    spark('sHeap',hist.heap);spark('sRssi',hist.rssi);spark('sLdr',hist.ldr);
+  }else{
+    pill.className='pill bad';pill.textContent='ESP32 injoignable';
+    $('eState').innerHTML=dot(false,'hors ligne');
+  }
+}
+tick();setInterval(tick,2000);
+</script>
+</body>
+</html>

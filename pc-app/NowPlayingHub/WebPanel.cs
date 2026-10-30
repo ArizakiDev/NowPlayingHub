@@ -15,12 +15,13 @@ public class WebPanel
     readonly SyncService _sync;
     readonly IdleService _idle;
     HttpListener? _listener;
-    string _html = "";
+    string _html = "", _statusHtml = "";
+    static readonly DateTime StartedAt = DateTime.UtcNow;
     static readonly JsonSerializerOptions J = new(JsonSerializerDefaults.Web);
 
     public int Port { get; private set; }
     public string Url => $"http://localhost:{Port}/";
-    public const string AppVersion = "1.1.0";
+    public const string AppVersion = "1.2.0";
 
     public WebPanel(AppConfig cfg, MediaService media, EspClient esp, Updater upd, SyncService sync, IdleService idle)
     {
@@ -33,6 +34,10 @@ public class WebPanel
         var res = asm.GetManifestResourceNames().First(n => n.EndsWith("panel.html"));
         using (var s = asm.GetManifestResourceStream(res)!)
         using (var r = new StreamReader(s, Encoding.UTF8)) _html = r.ReadToEnd();
+        var resSt = asm.GetManifestResourceNames().FirstOrDefault(n => n.EndsWith("status.html"));
+        if (resSt != null)
+            using (var s = asm.GetManifestResourceStream(resSt)!)
+            using (var r = new StreamReader(s, Encoding.UTF8)) _statusHtml = r.ReadToEnd();
 
         for (int p = _cfg.Port; p < _cfg.Port + 10; p++)
         {
@@ -110,6 +115,21 @@ public class WebPanel
                     await WriteAsync(c, 200, "text/html; charset=utf-8", Encoding.UTF8.GetBytes(_html));
                     break;
 
+                case "GET /status":
+                    await WriteAsync(c, 200, "text/html; charset=utf-8", Encoding.UTF8.GetBytes(_statusHtml));
+                    break;
+
+                case "GET /api/esp-status":
+                {
+                    // Etat detaille de la carte (relaye depuis son API /api/status)
+                    string? raw = null;
+                    try { raw = await _esp.GetStatusJsonAsync(); } catch { }
+                    if (raw == null) { await JsonAsync(c, new { online = false }); break; }
+                    using var sd = JsonDocument.Parse(raw);
+                    await JsonAsync(c, new { online = true, status = sd.RootElement.Clone() });
+                    break;
+                }
+
                 case "GET /api/state":
                     await JsonAsync(c, await BuildStateAsync());
                     break;
@@ -172,6 +192,7 @@ public class WebPanel
                     if (b.TryGetProperty("lrclib", out var lb) && (lb.ValueKind == JsonValueKind.True || lb.ValueKind == JsonValueKind.False)) _cfg.LyricsLrclib = lb.GetBoolean();
                     if (b.TryGetProperty("netease", out var nb) && (nb.ValueKind == JsonValueKind.True || nb.ValueKind == JsonValueKind.False)) _cfg.LyricsNetease = nb.GetBoolean();
                     _cfg.MusixmatchToken = Str(b, "musixmatchToken", _cfg.MusixmatchToken).Trim();
+                    if (b.TryGetProperty("offsetMs", out var om) && om.TryGetInt32(out var offs)) _cfg.LyricsOffsetMs = Math.Clamp(offs, -3000, 3000);
                     _cfg.Save();
                     await JsonAsync(c, new { ok = true });
                     break;
@@ -186,12 +207,37 @@ public class WebPanel
                     if (b.TryGetProperty("showApp", out var sa) && (sa.ValueKind == JsonValueKind.True || sa.ValueKind == JsonValueKind.False)) s.ShowApp = sa.GetBoolean();
                     if (b.TryGetProperty("dynamicAccent", out var da) && (da.ValueKind == JsonValueKind.True || da.ValueKind == JsonValueKind.False)) s.DynamicAccent = da.GetBoolean();
                     if (b.TryGetProperty("showLyrics", out var sl) && (sl.ValueKind == JsonValueKind.True || sl.ValueKind == JsonValueKind.False)) s.ShowLyrics = sl.GetBoolean();
+                    if (b.TryGetProperty("autoBrightness", out var ab) && (ab.ValueKind == JsonValueKind.True || ab.ValueKind == JsonValueKind.False)) s.AutoBrightness = ab.GetBoolean();
+                    if (b.TryGetProperty("ledMode", out var lm) && lm.TryGetInt32(out var lmv)) s.LedMode = Math.Clamp(lmv, 0, 3);
+                    if (b.TryGetProperty("ledBrightness", out var lb) && lb.TryGetInt32(out var lbv)) s.LedBrightness = Math.Clamp(lbv, 5, 100);
+                    if (b.TryGetProperty("ledNightOff", out var ln) && (ln.ValueKind == JsonValueKind.True || ln.ValueKind == JsonValueKind.False)) s.LedNightOff = ln.GetBoolean();
+                    if (b.TryGetProperty("sdCache", out var sc2) && (sc2.ValueKind == JsonValueKind.True || sc2.ValueKind == JsonValueKind.False)) s.SdCache = sc2.GetBoolean();
+                    if (b.TryGetProperty("sdMax", out var sm) && sm.TryGetInt32(out var smv)) s.SdMax = Math.Clamp(smv, 20, 1000);
+                    // Reglages propres a l'appli PC
+                    if (b.TryGetProperty("visualizer", out var vz) && (vz.ValueKind == JsonValueKind.True || vz.ValueKind == JsonValueKind.False)) _cfg.Visualizer = vz.GetBoolean();
+                    if (b.TryGetProperty("showPcStats", out var ps) && (ps.ValueKind == JsonValueKind.True || ps.ValueKind == JsonValueKind.False)) _cfg.ShowPcStats = ps.GetBoolean();
                     var acc = Str(b, "accent");
                     if (System.Text.RegularExpressions.Regex.IsMatch(acc, "^#[0-9A-Fa-f]{6}$")) s.Accent = acc.ToUpperInvariant();
                     _cfg.Save();
                     bool pushed = false;
                     try { pushed = await _esp.PushConfigAsync(_cfg); } catch (Exception e) { Log.Write("config: " + e.Message); }
                     await JsonAsync(c, new { ok = true, pushed });
+                    break;
+                }
+
+                case "POST /api/ldr-cal":
+                {
+                    var b = await BodyJsonAsync(c.Request);
+                    var which = Str(b, "which");
+                    bool ok = (which == "dark" || which == "bright") && await _esp.CalibrateLdrAsync(which);
+                    await JsonAsync(c, new { ok });
+                    break;
+                }
+
+                case "POST /api/sd-clear":
+                {
+                    bool ok = await _esp.ClearSdAsync();
+                    await JsonAsync(c, new { ok });
                     break;
                 }
 
@@ -348,7 +394,11 @@ public class WebPanel
             now = n == null ? (object?)null : new { n.State, n.Title, n.Artist, n.Album, n.Position, n.Duration, app = n.AppName, key = n.Key },
             sessions,
             selectedAppId = _cfg.SelectedAppId,
-            settings = new { espHost = _cfg.EspHost, espToken = _cfg.EspToken, githubRepo = _cfg.GithubRepo, lyricsLrclib = _cfg.LyricsLrclib, lyricsNetease = _cfg.LyricsNetease, musixmatchToken = _cfg.MusixmatchToken },
+            settings = new { espHost = _cfg.EspHost, espToken = _cfg.EspToken, githubRepo = _cfg.GithubRepo, lyricsLrclib = _cfg.LyricsLrclib, lyricsNetease = _cfg.LyricsNetease, musixmatchToken = _cfg.MusixmatchToken, lyricsOffsetMs = _cfg.LyricsOffsetMs, visualizer = _cfg.Visualizer, showPcStats = _cfg.ShowPcStats },
+            pc = _sync.PcStats.Latest,
+            spectrum = new { running = _sync.Spectrum.Running, packets = _sync.Spectrum.Packets, error = _sync.Spectrum.Error },
+            lyrics = new { source = _sync.Lyrics.LastSource, lines = _sync.Lyrics.LineCount },
+            appUptime = (long)(DateTime.UtcNow - StartedAt).TotalSeconds,
             espConfig = _cfg.Esp,
             update = new { busy = _upd.Status.Busy, percent = _upd.Status.Percent, message = _upd.Status.Message },
             autostart = Autostart.Get(),

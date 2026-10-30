@@ -1,9 +1,14 @@
 using System.Globalization;
+using System.Net;
+using System.Text.RegularExpressions;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Xml.Linq;
 
 namespace NowPlayingHub;
+
+/// <summary>Une actualite : titre + resume nettoye + heure de publication + source (v1.8, pour l'ecran detail de l'ESP32).</summary>
+public record NewsItem(string Title, string Desc, string When, string Source);
 
 public record WeatherData(float Temp, float FeelsLike, float Humidity, float UvIndex, int Code, string Description, float WindSpeed, string Location, string Sunrise, string Sunset);
 
@@ -15,6 +20,7 @@ public class IdleService
 
     public WeatherData? Weather { get; private set; }
     public List<string> Headlines { get; private set; } = new();
+    public List<NewsItem> NewsItems { get; private set; } = new();   // meme ordre que Headlines
 
     DateTime _lastWeather = DateTime.MinValue;
     DateTime _lastNews    = DateTime.MinValue;
@@ -137,12 +143,13 @@ public class IdleService
         {
             try
             {
-                var titles = await FetchRssTitlesAsync(url, _cfg.NewsCount);
-                if (titles.Count > 0)
+                var items = await FetchRssItemsAsync(url, _cfg.NewsCount);
+                if (items.Count > 0)
                 {
-                    Headlines = titles;
+                    NewsItems = items;
+                    Headlines = items.Select(i => i.Title).ToList();
                     _lastNews = DateTime.UtcNow;
-                    Log.Write($"News OK: {titles.Count} titres depuis {url}");
+                    Log.Write($"News OK: {items.Count} titres ({items.Count(i => i.Desc.Length > 0)} avec resume) depuis {url}");
                     return;
                 }
             }
@@ -154,7 +161,7 @@ public class IdleService
         Log.Write("idle/news: aucun flux RSS fonctionnel");
     }
 
-    async Task<List<string>> FetchRssTitlesAsync(string url, int maxCount)
+    async Task<List<NewsItem>> FetchRssItemsAsync(string url, int maxCount)
     {
         using var resp = await _http.GetAsync(url);
         if (!resp.IsSuccessStatusCode) return new();
@@ -171,11 +178,64 @@ public class IdleService
 
         var doc   = XDocument.Parse(body);
         var ns    = XNamespace.Get("http://www.w3.org/2005/Atom");
-        var items = doc.Descendants("item").Concat(doc.Descendants(ns + "entry")).Take(maxCount);
-        return items
-            .Select(i => (string?)(i.Element("title") ?? i.Element(ns + "title")))
-            .Where(t => !string.IsNullOrWhiteSpace(t))
-            .Select(t => t!.Trim())
-            .ToList();
+        var dc    = XNamespace.Get("http://purl.org/dc/elements/1.1/");
+        // Source par defaut = titre du flux (ex. "Le Monde - A la une")
+        var channelTitle = Clip(CleanText((string?)(doc.Descendants("channel").Elements("title").FirstOrDefault()
+                                                  ?? doc.Root?.Element(ns + "title")) ?? ""), 28);
+        var nodes = doc.Descendants("item").Concat(doc.Descendants(ns + "entry")).Take(maxCount);
+
+        var list = new List<NewsItem>();
+        foreach (var n in nodes)
+        {
+            var title = CleanText((string?)(n.Element("title") ?? n.Element(ns + "title")) ?? "");
+            if (title.Length == 0) continue;
+
+            // Resume : <description> (RSS) ou <summary>/<content> (Atom) ; HTML retire, entites decodees
+            var rawDesc = (string?)(n.Element("description") ?? n.Element(ns + "summary") ?? n.Element(ns + "content")) ?? "";
+            var desc = CleanText(rawDesc);
+            // Beaucoup de flux (Google News...) repetent le titre dans le resume : on le retire, s'il ne reste rien on n'envoie rien
+            if (desc.StartsWith(title, StringComparison.OrdinalIgnoreCase)) desc = desc.Substring(title.Length).TrimStart(' ', '-', '–', ':', '.');
+            if (desc.Length < 15) desc = "";
+            desc = Clip(desc, 280);
+
+            // Heure de publication, en heure locale : "HH:mm" si aujourd'hui, sinon "dd/MM HH:mm"
+            var pub = (string?)(n.Element("pubDate") ?? n.Element(ns + "published") ?? n.Element(ns + "updated") ?? n.Element(dc + "date"));
+            var when = "";
+            if (!string.IsNullOrWhiteSpace(pub) &&
+                DateTimeOffset.TryParse(pub, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dto))
+            {
+                var local = dto.ToLocalTime();
+                when = local.Date == DateTime.Now.Date ? local.ToString("HH:mm", CultureInfo.InvariantCulture)
+                                                       : local.ToString("dd/MM HH:mm", CultureInfo.InvariantCulture);
+            }
+
+            // Source : <source> (Google News, RSS 2.0) sinon titre du flux
+            var src = Clip(CleanText((string?)n.Element("source") ?? ""), 28);
+            if (src.Length == 0) src = channelTitle;
+
+            list.Add(new NewsItem(title, desc, when, src));
+        }
+        return list;
+    }
+
+    static readonly Regex _tags = new("<[^>]+>", RegexOptions.Compiled);
+    static readonly Regex _ws   = new("\\s+", RegexOptions.Compiled);
+
+    /// <summary>Retire le HTML, decode les entites (&amp;eacute; ...), compacte les espaces.</summary>
+    static string CleanText(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        s = _tags.Replace(s, " ");
+        s = WebUtility.HtmlDecode(WebUtility.HtmlDecode(s)).Replace('\u00A0', ' ');   // double decode : certains flux echappent deux fois
+        return _ws.Replace(s, " ").Trim();
+    }
+
+    /// <summary>Coupe a max caracteres sur une frontiere de mot, ajoute "..." si coupe.</summary>
+    static string Clip(string s, int max)
+    {
+        if (s.Length <= max) return s;
+        var cut = s.LastIndexOf(' ', max - 3);
+        if (cut < max / 2) cut = max - 3;
+        return s.Substring(0, cut).TrimEnd(' ', ',', ';', ':', '-') + "...";
     }
 }

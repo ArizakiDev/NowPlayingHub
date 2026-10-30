@@ -124,6 +124,13 @@ public class MediaService
         var mgr = await MgrAsync();
         var s = Pick(mgr.GetSessions());
         if (s == null) return false;
+        if (cmd.StartsWith("seek:", StringComparison.Ordinal))
+        {
+            // seek:<secondes> : se deplacer dans le morceau (si le lecteur le permet)
+            if (!double.TryParse(cmd[5..], System.Globalization.NumberStyles.Float,
+                                 System.Globalization.CultureInfo.InvariantCulture, out var secs) || secs < 0) return false;
+            return await s.TryChangePlaybackPositionAsync((long)(secs * 10_000_000));   // unites de 100 ns
+        }
         switch (cmd)
         {
             case "next":   return await s.TrySkipNextAsync();

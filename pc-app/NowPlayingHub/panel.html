@@ -35,10 +35,11 @@ input.num{width:100%;background:#10101a;border:1px solid var(--line);border-radi
 .sw b:hover{border-color:#fff}input[type=color]{width:34px;height:30px;border:0;background:none;padding:0}
 .msg{font-size:12px;color:var(--dim);margin-top:8px;min-height:16px}
 .val{float:right;color:var(--text)}
+a.btn{text-decoration:none;color:var(--text);font-size:13px}
 </style>
 </head>
 <body>
-<header><h1>Now Playing Hub</h1><span id="ver" class="pill"></span><span id="espPill" class="pill">ESP32 ...</span></header>
+<header><h1>Now Playing Hub</h1><span id="ver" class="pill"></span><a class="btn" href="/status" target="_blank">Statut</a><span id="espPill" class="pill">ESP32 ...</span></header>
 <main>
 
 <section class="card"><h2>En lecture</h2>
@@ -71,10 +72,35 @@ input.num{width:100%;background:#10101a;border:1px solid var(--line);border-radi
   <div style="margin:2px 0 6px 22px">
     <label><input id="lyLrclib" type="checkbox"> LRCLIB (lrclib.net)</label>
     <label><input id="lyNetease" type="checkbox"> NetEase Cloud Music (music.163.com) : très gros catalogue</label>
+    <label>Décalage des paroles <span id="lyOffV" class="val"></span></label><input id="lyOff" type="range" min="-2000" max="2000" step="100">
+    <div class="msg">Positif : les paroles apparaissent plus tôt ; négatif : plus tard.</div>
     <label>Musixmatch : ton jeton utilisateur (optionnel)</label><input id="lyMxm" type="password" placeholder="vide = Musixmatch désactivé">
     <div class="msg">Ordre d'essai : LRCLIB, Musixmatch, NetEase. Musixmatch ne propose pas d'API gratuite pour les paroles synchronisées : cette source utilise l'API non officielle de leur appli de bureau avec ton propre jeton (peut cesser de fonctionner à tout moment).</div>
   </div>
   <div id="cfgMsg" class="msg"></div>
+</section>
+
+<section class="card"><h2>Matériel de la carte</h2>
+  <label><input id="autoBri" type="checkbox"> Luminosité automatique (capteur de lumière de la carte)</label>
+  <div class="ctrl"><button onclick="cal('dark')">Il fait sombre</button><button onclick="cal('bright')">Il fait clair</button></div>
+  <div class="msg">Calibration : dans l'obscurité clique « Il fait sombre », puis sous ta lumière habituelle « Il fait clair ». Valeur du capteur : <b id="ldrNow">--</b> <span id="ldrMsg"></span></div>
+  <label>LED RGB de la carte</label>
+  <select id="ledMode" class="num">
+    <option value="0">Éteinte</option><option value="1">Couleur d'accent (fixe)</option>
+    <option value="2">Pulsation</option><option value="3">Suit les basses (visualiseur)</option>
+  </select>
+  <label>Luminosité de la LED <span id="ledBriV" class="val"></span></label><input id="ledBri" type="range" min="5" max="100">
+  <label><input id="ledNight" type="checkbox"> Éteindre la LED en mode nuit</label>
+  <label><input id="viz" type="checkbox"> Visualiseur de spectre : capture le son du PC (seulement quand la carte l'affiche)</label>
+  <div class="msg">Écran de lecture : touche le titre / l'artiste pour le visualiseur, la barre de progression pour te déplacer dans le morceau, les paroles pour les voir en grand, la pochette pour la voir en plein écran.</div>
+</section>
+
+<section class="card"><h2>Carte SD et veille</h2>
+  <label><input id="sdOn" type="checkbox"> Garder les pochettes sur la carte SD (affichage instantané des pistes déjà écoutées)</label>
+  <label>Pistes gardées <span id="sdMaxV" class="val"></span></label><input id="sdMax" type="range" min="20" max="1000" step="10">
+  <div class="ctrl"><button onclick="sdClear()">Vider le cache</button></div>
+  <div id="sdInfo" class="msg"></div>
+  <label><input id="pcStats" type="checkbox"> Stats du PC sur l'écran de veille (ligne discrète en bas à gauche ; touche-la pour la page détaillée)</label>
 </section>
 
 <section class="card"><h2>Connexion</h2>
@@ -176,6 +202,9 @@ async function refresh(){
   document.querySelectorAll('#sessions button').forEach(b=>b.onclick=()=>selectApp(b.dataset.id));
   if(!loaded){loaded=true;
     $('bri').value=s.espConfig.brightness;$('scr').value=s.espConfig.scrollSpeed;$('acc').value=s.espConfig.accent.toLowerCase();$('showApp').checked=s.espConfig.showApp;$('dynAcc').checked=s.espConfig.dynamicAccent!==false;$('lyrics').checked=s.espConfig.showLyrics!==false;
+    $('autoBri').checked=!!s.espConfig.autoBrightness;$('ledMode').value=s.espConfig.ledMode??0;$('ledBri').value=s.espConfig.ledBrightness??40;$('ledNight').checked=s.espConfig.ledNightOff!==false;
+    $('sdOn').checked=!!s.espConfig.sdCache;$('sdMax').value=s.espConfig.sdMax??150;$('viz').checked=s.settings.visualizer!==false;$('pcStats').checked=s.settings.showPcStats!==false;
+    $('lyOff').value=s.settings.lyricsOffsetMs||0;$('lyOffV').textContent=($('lyOff').value/1000).toFixed(1)+' s';$('ledBriV').textContent=$('ledBri').value+' %';$('sdMaxV').textContent=$('sdMax').value;
     $('lyLrclib').checked=s.settings.lyricsLrclib!==false;$('lyNetease').checked=s.settings.lyricsNetease!==false;$('lyMxm').value=s.settings.musixmatchToken||'';
     $('host').value=s.settings.espHost;$('token').value=s.settings.espToken;$('repo').value=s.settings.githubRepo;$('auto').checked=s.autostart;
     $('briV').textContent=$('bri').value+' %';$('scrV').textContent=$('scr').value+' px/s';
@@ -190,14 +219,17 @@ async function refresh(){
 
 function pushCfg(){
   $('briV').textContent=$('bri').value+' %';$('scrV').textContent=$('scr').value+' px/s';
+  $('ledBriV').textContent=$('ledBri').value+' %';$('sdMaxV').textContent=$('sdMax').value;
   clearTimeout(timer);timer=setTimeout(async()=>{
-    const r=await api('/api/esp-config',{brightness:+$('bri').value,scrollSpeed:+$('scr').value,accent:$('acc').value,showApp:$('showApp').checked,dynamicAccent:$('dynAcc').checked,showLyrics:$('lyrics').checked});
+    const r=await api('/api/esp-config',{brightness:+$('bri').value,scrollSpeed:+$('scr').value,accent:$('acc').value,showApp:$('showApp').checked,dynamicAccent:$('dynAcc').checked,showLyrics:$('lyrics').checked,
+      autoBrightness:$('autoBri').checked,ledMode:+$('ledMode').value,ledBrightness:+$('ledBri').value,ledNightOff:$('ledNight').checked,
+      visualizer:$('viz').checked,showPcStats:$('pcStats').checked,sdCache:$('sdOn').checked,sdMax:+$('sdMax').value});
     $('cfgMsg').textContent=r.pushed?'Applique sur la carte.':'Enregistre (la carte est injoignable, il sera applique a sa prochaine connexion).';
   },250);
 }
-['bri','scr','acc','showApp','dynAcc','lyrics'].forEach(i=>$(i).addEventListener('input',pushCfg));
-function pushLy(){clearTimeout(tLy);tLy=setTimeout(async()=>{await api('/api/lyrics-config',{lrclib:$('lyLrclib').checked,netease:$('lyNetease').checked,musixmatchToken:$('lyMxm').value});$('cfgMsg').textContent='Sources de paroles enregistrees.'},500)}
-['lyLrclib','lyNetease','lyMxm'].forEach(i=>$(i).addEventListener('input',pushLy));
+['bri','scr','acc','showApp','dynAcc','lyrics','autoBri','ledMode','ledBri','ledNight','viz','pcStats','sdOn','sdMax'].forEach(i=>$(i).addEventListener('input',pushCfg));
+function pushLy(){clearTimeout(tLy);tLy=setTimeout(async()=>{await api('/api/lyrics-config',{lrclib:$('lyLrclib').checked,netease:$('lyNetease').checked,musixmatchToken:$('lyMxm').value,offsetMs:+$('lyOff').value});$('lyOffV').textContent=($('lyOff').value/1000).toFixed(1)+' s';$('cfgMsg').textContent='Sources de paroles enregistrees.'},500)}
+['lyLrclib','lyNetease','lyMxm','lyOff'].forEach(i=>$(i).addEventListener('input',pushLy));
 document.querySelectorAll('.sw b').forEach(b=>b.onclick=()=>{$('acc').value=b.dataset.c.toLowerCase();pushCfg()});
 
 async function saveSettings(){
@@ -245,7 +277,23 @@ async function flashFile(){
   const r=await fetch('/api/update/file',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f}).then(x=>x.json()).catch(()=>({}));
   if(r.error)$('uMsg').textContent=r.error;
 }
-refresh();setInterval(refresh,1000);
+async function cal(w){
+  const r=await api('/api/ldr-cal',{which:w});
+  $('ldrMsg').textContent=r.ok?('Enregistré ('+(w==='dark'?'sombre':'clair')+').'):'Échec (carte injoignable ?).';
+}
+async function sdClear(){
+  if(!confirm('Vider le cache de pochettes de la carte SD ?'))return;
+  const r=await api('/api/sd-clear',{});$('sdInfo').textContent=r.ok?'Cache vidé.':'Échec (carte injoignable ?).';
+}
+async function pollEsp(){
+  let r;try{r=await api('/api/esp-status')}catch{return}
+  if(!r.online){$('ldrNow').textContent='--';return}
+  const e=r.status||{};
+  $('ldrNow').textContent=e.ldrRaw+' ('+e.ldrLight+' % de lumière)';
+  const sd=e.sd||{};
+  $('sdInfo').textContent=!sd.enabled?'Cache désactivé.':sd.ok?('Carte SD détectée : '+sd.sizeMB+' Mo, '+sd.files+' fichiers en cache.'):'Aucune carte SD détectée (insère-la puis réactive l\'option).';
+}
+refresh();setInterval(refresh,1000);pollEsp();setInterval(pollEsp,2500);
 </script>
 </body>
 </html>

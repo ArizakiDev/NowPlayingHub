@@ -7,10 +7,15 @@
     <Nullable>enable</Nullable>
     <RootNamespace>NowPlayingHub</RootNamespace>
     <AssemblyName>NowPlayingHub</AssemblyName>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="panel.html" />
+    <EmbeddedResource Include="status.html" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Capture du son (WASAPI loopback) pour le visualiseur de spectre -->
+    <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
   </ItemGroup>
 </Project>

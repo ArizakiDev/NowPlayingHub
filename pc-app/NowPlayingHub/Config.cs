@@ -12,7 +12,14 @@ public class EspSettings
     public int ScrollSpeed { get; set; } = 45;
     public bool ShowApp { get; set; } = true;
     public bool DynamicAccent { get; set; } = true;   // couleur d'accent tiree de la pochette
-    public bool ShowLyrics { get; set; } = true;      // paroles synchronisees (LRCLIB)
+    public bool ShowLyrics { get; set; } = true;      // paroles synchronisees (LRCLIB, Musixmatch, NetEase)
+    // --- v1.6 (envoyes a la carte) ---
+    public bool AutoBrightness { get; set; } = false; // luminosite automatique (capteur de lumiere)
+    public int  LedMode { get; set; } = 0;            // LED RGB : 0 eteinte, 1 accent, 2 pulsation, 3 suit les basses
+    public int  LedBrightness { get; set; } = 40;     // %
+    public bool LedNightOff { get; set; } = true;     // LED eteinte pendant le mode nuit
+    public bool SdCache { get; set; } = false;        // cache de pochettes sur la carte SD
+    public int  SdMax { get; set; } = 150;            // nombre de pistes gardees
 }
 
 /// <summary>Configuration de l'appli PC : %AppData%\NowPlayingHub\config.json</summary>
@@ -27,6 +34,9 @@ public class AppConfig
     public bool LyricsLrclib { get; set; } = true;
     public bool LyricsNetease { get; set; } = true;
     public string MusixmatchToken { get; set; } = "";   // vide = Musixmatch desactive
+    public int LyricsOffsetMs { get; set; } = 0;        // >0 : les paroles apparaissent plus tot ; <0 : plus tard
+    public bool Visualizer { get; set; } = true;        // spectre audio envoye a la carte (uniquement quand elle l'affiche)
+    public bool ShowPcStats { get; set; } = true;       // stats du PC sur l'ecran de veille de la carte
     public bool AsciiOnly { get; set; } = true;
     public int Port { get; set; } = 8123;
     public EspSettings Esp { get; set; } = new();
