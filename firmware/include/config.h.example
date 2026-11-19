@@ -1,5 +1,9 @@
 #pragma once
-// Copie ce fichier en config.h et renseigne tes valeurs (NE PAS publier config.h)
-#define WIFI_SSID  "ton_ssid"
-#define WIFI_PASS  "ton_mot_de_passe"
+// Config perso, OPTIONNELLE : copie ce fichier en config.h pour un build perso (pio run -e cyd).
+// NE PAS publier config.h (il est dans le .gitignore). Le build public (pio run -e release) l'ignore.
+//
+// Tu peux tout laisser vide : au premier demarrage la carte ouvre le reseau "NowPlaying-Setup" (portail captif)
+// et tu y choisis ton Wi-Fi et un jeton de mise a jour.
+#define WIFI_SSID  ""
+#define WIFI_PASS  ""
 #define OTA_TOKEN  "un_token_long_et_aleatoire"

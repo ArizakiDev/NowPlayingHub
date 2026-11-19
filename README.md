@@ -5,12 +5,16 @@ Un petit écran de bureau qui affiche **ce que tu écoutes** (Cider / Apple Musi
 Matériel : **ESP32-2432S028R** (« Cheap Yellow Display », ILI9341 320×240, tactile résistif).
 
 - Pochette, titre défilant, artiste, barre de progression, boutons tactiles précédent / lecture / suivant
-- **Tactile** : toucher la barre de progression pour se déplacer dans le morceau, les paroles pour les voir en grand, le bloc titre/artiste pour le **visualiseur de spectre**, la pochette pour la voir en **plein écran 240×240** (balayage gauche/droite = suivant/précédent)
+- **Tactile** : toucher **ou faire glisser** la barre de progression pour se déplacer dans le morceau (aperçu en direct), **balayer vers le haut/bas la colonne de droite pour le volume du PC**, les paroles pour les voir en grand, le bloc titre/artiste pour le **visualiseur de spectre**, la pochette pour la voir en **plein écran 240×240** (balayage gauche/droite = suivant/précédent)
 - **Luminosité automatique** (capteur de lumière de la carte) et **LED RGB** (couleur d'accent, pulsation ou rythme des basses)
 - **Cache de pochettes sur carte SD** (optionnel)
 - **Page de statut** sur `http://localhost:8123/status` (carte, lecture, capteurs, SD, spectre, stats du PC)
 - Écran de veille : horloge, date, météo (Open-Meteo), UV, lever/coucher du soleil, défilement d'actus RSS, et une ligne très discrète avec les stats du PC (toucher pour la page « Mon PC »)
 - Mode nuit et mise en veille de la luminosité, réglables
+- **Paroles à la milliseconde** (la carte change de ligne à l'instant exact), cache des paroles sur disque
+- **Historique d'écoute** local et statistiques (titres / artistes les plus écoutés) sur la page de statut
+- **Suivi automatique du lecteur qui joue** (option « Celui qui joue »), volume / muet dans le menu de la zone de notification
+- **Menu réglages sur la carte** (toucher le coin haut droit de l'accueil) : curseur de luminosité à glisser, interrupteurs mode nuit / luminosité auto, mode de la LED, signal Wi-Fi et IP, diagnostic, redémarrage avec confirmation
 - **Panel web** pour tout configurer depuis le navigateur
 - **Mises à jour du firmware en Wi-Fi** (GitHub ou fichier `.bin`)
 
@@ -43,16 +47,17 @@ Rien à câbler : tout est déjà sur la carte (CYD).
 
 Prérequis : [PlatformIO](https://platformio.org/).
 
+Deux builds, selon l'usage :
+
 ```bash
-cp firmware/include/config.example.h firmware/include/config.h
-# édite config.h : OTA_TOKEN (à changer !) et, si tu veux, WIFI_SSID / WIFI_PASS
 cd firmware
-pio run -t upload
+pio run -e release -t upload   # build PUBLIC : aucun identifiant dans le .bin (config.h ignoré)
+pio run -e cyd -t upload       # build perso : utilise include/config.h s'il existe
 ```
 
-> `config.h` contient tes secrets : il est dans le `.gitignore`, ne le commite jamais.
+`config.h` est **optionnel** (copie `config.h.example` si tu veux intégrer ton Wi-Fi et ton jeton). Il est dans le `.gitignore` : ne le commite jamais. Le port série est détecté automatiquement (force-le dans `platformio.ini` si besoin).
 
-**Wi-Fi sans recompiler** : si tu laisses `WIFI_SSID` vide, la carte ouvre au premier démarrage un réseau **`NowPlaying-Setup`**. Connecte-toi avec ton téléphone, une page s'ouvre (sinon `192.168.4.1`), choisis ton réseau 2,4 GHz et entre le mot de passe : la carte redémarre et s'y connecte. Le même mode s'active si elle n'arrive pas à se connecter pendant 90 s après un démarrage. Pour oublier le Wi-Fi : bouton dans le panel, ou page `http://nowplaying.local`.
+**Wi-Fi sans recompiler** : sans identifiants intégrés, la carte ouvre au premier démarrage un réseau **`NowPlaying-Setup`**. Connecte-toi avec ton téléphone, une page s'ouvre (sinon `192.168.4.1`), choisis ton réseau 2,4 GHz, entre le mot de passe et, si tu veux, un **jeton de mise à jour** (à recopier dans l'appli PC, onglet Connexion ; défaut `nowplaying`). La carte redémarre et s'y connecte. Le même mode s'active si elle n'arrive pas à se connecter pendant 90 s après un démarrage. Pour oublier le Wi-Fi : bouton dans le panel, ou page `http://nowplaying.local` (le jeton est conservé).
 
 Si les couleurs sont inversées, regarde `firmware/include/User_Setup.h` (`TFT_INVERSION_ON`, `TFT_BGR`/`TFT_RGB`).
 
@@ -91,12 +96,12 @@ Dans le panel, carte **Firmware de la carte** :
 
 ### Publier une release
 
-Le `firmware.bin` embarque ton `OTA_TOKEN` (compilé via `config.h`, jamais commité), et ton Wi-Fi si tu l'y as mis. Il se compile donc **en local** et s'ajoute à la main à la release : la CI ne peut pas le faire sans exposer tes secrets. Un firmware compilé avec `WIFI_SSID` vide est réutilisable par tout le monde, le Wi-Fi se configurant sur la carte.
+Le build **`release`** n'embarque aucun secret (ni Wi-Fi, ni jeton) : il est réutilisable par tout le monde, et la CI peut le compiler. Le build `cyd` (perso) embarque le contenu de `config.h` : ne le publie jamais.
 
 1. Monte `FW_VERSION` dans `firmware/include/settings.h`.
-2. `pio run -d firmware`
-3. `git tag v1.4.1 && git push --tags` → la CI compile et attache `NowPlayingHub-win-x64.zip`.
-4. Sur la page de la release GitHub, ajoute `firmware/.pio/build/cyd/firmware.bin`.
+2. `pio run -e release -d firmware`
+3. `git tag v1.10.0 && git push --tags` → la CI compile et attache `NowPlayingHub-win-x64.zip`.
+4. Sur la page de la release GitHub, ajoute `firmware/.pio/build/release/firmware.bin`. GitHub en calcule l'empreinte SHA-256, que l'appli vérifie avant d'installer.
 
 Le **tag doit correspondre à `FW_VERSION`** (avec ou sans le `v`), sinon l'appli compare mal les versions.
 
@@ -104,7 +109,7 @@ Le **tag doit correspondre à `FW_VERSION`** (avec ou sans le `v`), sinon l'appl
 
 | Route | Rôle |
 |---|---|
-| `POST /api/nowplaying` | état de lecture (titre, artiste, position, paroles…). La réponse peut contenir `needCover`, `needBig`, `viz` et `cmd` (`prev`, `toggle`, `next`, `seek:<secondes>`) |
+| `POST /api/nowplaying` | état de lecture (titre, artiste, position, paroles…). La réponse peut contenir `needCover`, `needBig`, `viz` et `cmd` (`prev`, `toggle`, `next`, `seek:<secondes>`, `volup`, `voldown`, `mute`). La requête peut contenir `lyricIn` (ms avant la ligne suivante) |
 | `POST /api/cover?id=` / `/api/icon?id=` | pochette / logo (JPEG en base64) |
 | `GET/POST /api/config` | luminosité, couleur, défilement, mode nuit, veille |
 | `POST /api/reboot`, `/api/wifireset` | redémarrer / oublier le Wi-Fi (`?token=`) |

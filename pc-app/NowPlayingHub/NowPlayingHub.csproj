@@ -2,20 +2,25 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>NowPlayingHub</RootNamespace>
     <AssemblyName>NowPlayingHub</AssemblyName>
-    <Version>1.2.0</Version>
+    <Version>2.2.0</Version>
+    <ApplicationIcon>app.ico</ApplicationIcon>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
   <ItemGroup>
-    <EmbeddedResource Include="panel.html" />
-    <EmbeddedResource Include="status.html" />
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
   </ItemGroup>
   <ItemGroup>
-    <!-- Capture du son (WASAPI loopback) pour le visualiseur de spectre -->
+    <EmbeddedResource Include="app.ico" />
+    <EmbeddedResource Include="Web\status.html" LogicalName="status.html" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
   </ItemGroup>
 </Project>

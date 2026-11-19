@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pc-app:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Publier l'appli PC
+        run: dotnet publish pc-app/NowPlayingHub/NowPlayingHub.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -o dist
+      - name: Archive
+        run: Compress-Archive -Path dist/NowPlayingHub.exe -DestinationPath NowPlayingHub-win-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pc-app
+          path: NowPlayingHub-win-x64.zip
+
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install platformio
+      - name: Compiler le firmware public (sans config.h)
+        run: pio run -d firmware -e release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: firmware/.pio/build/release/firmware.bin
+
+  publish:
+    needs: [pc-app, firmware]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            out/pc-app/NowPlayingHub-win-x64.zip
+            out/firmware/firmware.bin

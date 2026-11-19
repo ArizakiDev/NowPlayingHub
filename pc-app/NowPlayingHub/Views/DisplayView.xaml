@@ -1,0 +1,58 @@
+<UserControl x:Class="NowPlayingHub.DisplayView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="clr-namespace:NowPlayingHub">
+  <ScrollViewer VerticalScrollBarVisibility="Auto">
+    <StackPanel Margin="36,24,36,36" MaxWidth="820" HorizontalAlignment="Left">
+      <TextBlock Text="Écran" Style="{StaticResource PageTitle}"/>
+      <Border Style="{StaticResource Tile}">
+        <StackPanel>
+          <TextBlock Text="Luminosité et défilement" Style="{StaticResource TileTitle}"/>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Luminosité" Tag="Valeur maximale : la luminosité automatique (page matériel) ne la dépasse jamais."><StackPanel Orientation="Horizontal"><Slider Minimum="5" Maximum="100" Value="{Binding Brightness}"/><TextBlock Width="64" TextAlignment="Right" VerticalAlignment="Center" Style="{StaticResource Mono}" Text="{Binding Brightness, StringFormat={}{0} %}"/></StackPanel></HeaderedContentControl>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Vitesse de défilement du titre"><StackPanel Orientation="Horizontal"><Slider Minimum="10" Maximum="150" Value="{Binding ScrollSpeed}"/><TextBlock Width="64" TextAlignment="Right" VerticalAlignment="Center" Style="{StaticResource Mono}" Text="{Binding ScrollSpeed, StringFormat={}{0}}"/></StackPanel></HeaderedContentControl>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Nom et logo de l'application" Tag="Affichés en haut de l'écran de lecture."><CheckBox IsChecked="{Binding ShowApp}"/></HeaderedContentControl>
+        </StackPanel>
+      </Border>
+      <Border Style="{StaticResource Tile}">
+        <StackPanel>
+          <TextBlock Text="Couleur d'accent" Style="{StaticResource TileTitle}"/>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Couleur tirée de la pochette" Tag="Calculée une fois par morceau. Sinon, la couleur fixe ci-dessous est utilisée."><CheckBox IsChecked="{Binding DynamicAccent}"/></HeaderedContentControl>
+          <ItemsControl ItemsSource="{Binding Swatches}" Margin="0,0,0,14">
+            <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Button Width="32" Height="32" Margin="0,0,8,8" Background="{Binding Hex}" ToolTip="{Binding Hex}"
+                        Command="{Binding DataContext.PickAccentCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                        CommandParameter="{Binding Hex}">
+                  <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                      <Border x:Name="B" Background="{TemplateBinding Background}" BorderThickness="2" BorderBrush="Transparent"/>
+                      <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="B" Property="BorderBrush" Value="White"/></Trigger>
+                      </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                  </Button.Template>
+                </Button>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <TextBlock Text="Couleur fixe (#RRGGBB)" Style="{StaticResource Caption}"/>
+          <TextBox Text="{Binding AccentText, UpdateSourceTrigger=LostFocus}" Width="140" HorizontalAlignment="Left" FontFamily="{StaticResource MonoFont}"/>
+        </StackPanel>
+      </Border>
+      <Border Style="{StaticResource Tile}">
+        <StackPanel>
+          <TextBlock Text="Mode nuit" Style="{StaticResource TileTitle}"/>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Activer le mode nuit" Tag="Luminosité réduite pendant la plage choisie."><CheckBox IsChecked="{Binding NightEnabled}"/></HeaderedContentControl>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Début"><StackPanel Orientation="Horizontal"><Slider Minimum="0" Maximum="23" Value="{Binding NightStart}"/><TextBlock Width="64" TextAlignment="Right" VerticalAlignment="Center" Style="{StaticResource Mono}" Text="{Binding NightStart, StringFormat={}{0} h}"/></StackPanel></HeaderedContentControl>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Fin"><StackPanel Orientation="Horizontal"><Slider Minimum="0" Maximum="23" Value="{Binding NightEnd}"/><TextBlock Width="64" TextAlignment="Right" VerticalAlignment="Center" Style="{StaticResource Mono}" Text="{Binding NightEnd, StringFormat={}{0} h}"/></StackPanel></HeaderedContentControl>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Luminosité de nuit"><StackPanel Orientation="Horizontal"><Slider Minimum="1" Maximum="100" Value="{Binding NightBrightness}"/><TextBlock Width="64" TextAlignment="Right" VerticalAlignment="Center" Style="{StaticResource Mono}" Text="{Binding NightBrightness, StringFormat={}{0} %}"/></StackPanel></HeaderedContentControl>
+        </StackPanel>
+      </Border>
+      <Border Style="{StaticResource Tile}">
+        <StackPanel>
+          <TextBlock Text="Mise en veille" Style="{StaticResource TileTitle}"/>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Atténuer après" Tag="Sans interaction et sans lecture."><StackPanel Orientation="Horizontal"><Slider Minimum="1" Maximum="60" Value="{Binding DimAfterMinutes}"/><TextBlock Width="64" TextAlignment="Right" VerticalAlignment="Center" Style="{StaticResource Mono}" Text="{Binding DimAfterMinutes, StringFormat={}{0} min}"/></StackPanel></HeaderedContentControl>
+          <HeaderedContentControl Style="{StaticResource Row}" Header="Luminosité atténuée"><StackPanel Orientation="Horizontal"><Slider Minimum="1" Maximum="100" Value="{Binding DimBrightness}"/><TextBlock Width="64" TextAlignment="Right" VerticalAlignment="Center" Style="{StaticResource Mono}" Text="{Binding DimBrightness, StringFormat={}{0} %}"/></StackPanel></HeaderedContentControl>
+        </StackPanel>
+      </Border>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

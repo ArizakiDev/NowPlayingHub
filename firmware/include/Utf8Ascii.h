@@ -1,20 +1,10 @@
-// =============================================================================
-//  Utf8Ascii.h — convertit l'UTF-8 (accents, guillemets typographiques...) en ASCII
-//  affichable par les polices TFT_eSPI (qui n'ont pas les glyphes accentues).
-//  - cleanUTF8Into() : version buffer (aucune allocation)
-//  - cleanUTF8()     : version String, a utiliser a la RECEPTION des donnees
-//                      (jamais dans la boucle d'affichage)
-//  Gere aussi le "mojibake" (UTF-8 relu en Latin-1 : "Ã©" -> "e").
-// =============================================================================
 #pragma once
 #include <Arduino.h>
 
 namespace u8 {
-// U+00C0..U+00FF  (Æ, ß traites a part)
 static const char LAT1[] =
   "AAAAAAACEEEEIIII" "DNOOOOOxOUUUUYTs"
   "aaaaaaaceeeeiiii" "dnooooo/ouuuuyty";
-// U+0100..U+017F  (Œ/œ traites a part)
 static const char EXTA[] =
   "AaAaAaCcCcCcCcDd" "DdEeEeEeEeEeGgGg" "GgGgHhHhIiIiIiIi" "IiIiJjKkkLlLlLlL"
   "lLlNnNnNnnNnOoOo" "OoOoRrRrRrSsSsSs" "SsTtTtTtUuUuUuUu" "UuUuWwYyYZzZzZzs";
@@ -25,25 +15,25 @@ inline size_t cleanUTF8Into(const char* in, char* out, size_t cap) {
   size_t o = 0;
   auto put = [&](const char* s) {
     for (; *s && o + 1 < cap; s++) {
-      if (*s == ' ' && (o == 0 || out[o - 1] == ' ')) continue;   // pas d'espaces doubles/en tete
+      if (*s == ' ' && (o == 0 || out[o - 1] == ' ')) continue;
       out[o++] = *s;
     }
   };
   const uint8_t* p = (const uint8_t*)in;
-  bool prevA = false;                                   // "Ã" en attente (mojibake)
+  bool prevA = false;
   while (p && *p) {
     uint32_t c = *p; int extra = 0;
     if (c < 0x80)                  extra = 0;
     else if ((c & 0xE0) == 0xC0) { c &= 0x1F; extra = 1; }
     else if ((c & 0xF0) == 0xE0) { c &= 0x0F; extra = 2; }
     else if ((c & 0xF8) == 0xF0) { c &= 0x07; extra = 3; }
-    else { p++; continue; }                             // octet isole invalide
+    else { p++; continue; }
     p++;
     for (int i = 0; i < extra; i++) {
       if ((*p & 0xC0) != 0x80) { c = 0xFFFD; break; }
       c = (c << 6) | (*p & 0x3F); p++;
     }
-    if (prevA) {                                        // "Ã" + "©" = "é" mal decode
+    if (prevA) {
       prevA = false;
       if (c >= 0x80 && c <= 0xBF) c = 0xC0 | (c & 0x3F); else put("A");
     } else if (c == 0xC3) { prevA = true; continue; }
@@ -70,11 +60,11 @@ inline size_t cleanUTF8Into(const char* in, char* out, size_t cap) {
       case 0xA3:   put("GBP"); break;
       case 0xA9:   put("(c)"); break;
       case 0x2122: put("TM");  break;
-      default: break;                                    // emoji, symboles : ignores
+      default: break;
     }
   }
   if (prevA) put("A");
-  while (o > 0 && out[o - 1] == ' ') o--;                // pas d'espace final
+  while (o > 0 && out[o - 1] == ' ') o--;
   out[o] = 0;
   return o;
 }

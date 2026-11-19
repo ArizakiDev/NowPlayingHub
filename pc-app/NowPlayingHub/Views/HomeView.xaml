@@ -1,0 +1,116 @@
+<UserControl x:Class="NowPlayingHub.HomeView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:NowPlayingHub">
+  <ScrollViewer VerticalScrollBarVisibility="Auto">
+    <StackPanel Margin="36,24,36,36" MaxWidth="880" HorizontalAlignment="Left">
+      <TextBlock Text="En lecture" Style="{StaticResource PageTitle}"/>
+
+      <Border Style="{StaticResource Tile}" BorderBrush="{DynamicResource WarnBrush}" BorderThickness="3,1,1,1"
+              Visibility="{Binding IsOffline, Converter={StaticResource B2V}}">
+        <Grid>
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <StackPanel>
+            <TextBlock Text="La carte ne répond pas" FontSize="16"/>
+            <TextBlock Style="{StaticResource Dim}" Margin="0,4,0,0"
+                       Text="Vérifie qu'elle est allumée et sur le même réseau, puis contrôle l'adresse et le jeton dans « Système »."/>
+          </StackPanel>
+          <Button Grid.Column="1" Content="Régler la connexion" Command="{Binding GoConnectionCommand}" VerticalAlignment="Center" Margin="16,0,0,0"/>
+        </Grid>
+      </Border>
+
+      <Grid Margin="0,0,0,18">
+        <Border x:Name="HeroMask" CornerRadius="12" Background="{DynamicResource BgBrush}"/>
+        <Grid>
+          <Grid.OpacityMask><VisualBrush Visual="{Binding ElementName=HeroMask}"/></Grid.OpacityMask>
+          <Border Background="{DynamicResource BgBrush}"/>
+          <Border Background="{DynamicResource SurfaceBrush}"/>
+          <Grid ClipToBounds="True">
+            <Image Source="{Binding Cover}" Stretch="UniformToFill" Opacity="0.7" RenderOptions.BitmapScalingMode="LowQuality">
+              <Image.Effect><BlurEffect Radius="55" KernelType="Gaussian" RenderingBias="Performance"/></Image.Effect>
+            </Image>
+          </Grid>
+          <Border Background="{DynamicResource ContentBrush}" Opacity="0.62"/>
+        </Grid>
+
+        <Grid Margin="26">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+          <Border Width="220" Height="220" VerticalAlignment="Top" Background="{DynamicResource Surface2Brush}" CornerRadius="10">
+            <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="8" Direction="270" Opacity="0.35" Color="Black"/></Border.Effect>
+            <Grid>
+              <Grid.Clip><RectangleGeometry Rect="0,0,220,220" RadiusX="10" RadiusY="10"/></Grid.Clip>
+              <TextBlock Text="&#x266A;" FontSize="88" HorizontalAlignment="Center" VerticalAlignment="Center"
+                         Foreground="{DynamicResource RailBrush}"/>
+              <Image Source="{Binding Cover}" Stretch="UniformToFill" RenderOptions.BitmapScalingMode="HighQuality"/>
+            </Grid>
+          </Border>
+
+          <StackPanel Grid.Column="1" Margin="28,0,0,0" VerticalAlignment="Center">
+            <StackPanel Visibility="{Binding HasTrack, Converter={StaticResource B2V}}">
+              <TextBlock Text="{Binding AppName}" Foreground="{DynamicResource AccentBrush}" FontSize="12" FontWeight="SemiBold" Margin="0,0,0,8"/>
+              <TextBlock Text="{Binding TrackTitle}" FontFamily="{StaticResource LightFont}" FontWeight="SemiBold" FontSize="28" TextTrimming="CharacterEllipsis"/>
+              <TextBlock Text="{Binding Artist}" FontSize="18" Foreground="{DynamicResource DimBrush}" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
+              <TextBlock Text="{Binding Album}" FontSize="13" Foreground="{DynamicResource DimBrush}" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
+
+              <Grid Margin="0,20,0,2" Height="22" Background="Transparent" Cursor="Hand" MouseLeftButtonUp="OnBarClick">
+                <ProgressBar x:Name="Bar" Minimum="0" Maximum="1" Value="{Binding Progress, Mode=OneWay}" VerticalAlignment="Center" IsHitTestVisible="False"/>
+              </Grid>
+              <Grid>
+                <TextBlock Text="{Binding PositionText}" Style="{StaticResource Mono}" Foreground="{DynamicResource DimBrush}"/>
+                <TextBlock Text="{Binding DurationText}" Style="{StaticResource Mono}" Foreground="{DynamicResource DimBrush}" HorizontalAlignment="Right"/>
+              </Grid>
+
+              <Grid Margin="0,14,0,0">
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
+                  <Button Style="{StaticResource RoundButton}" Content="&#xE100;" Command="{Binding PrevCommand}" VerticalAlignment="Center"/>
+                  <Button Style="{StaticResource PlayButton}" Content="{Binding PlayGlyph}" Command="{Binding ToggleCommand}" VerticalAlignment="Center"/>
+                  <Button Style="{StaticResource RoundButton}" Content="&#xE101;" Command="{Binding NextCommand}" VerticalAlignment="Center"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center" ToolTip="Volume du PC">
+                  <Button Style="{StaticResource SmallRound}" Content="&#x2212;" Command="{Binding VolDownCommand}"/>
+                  <Button Style="{StaticResource SmallRound}" Content="&#xE74F;" Command="{Binding MuteCommand}"/>
+                  <Button Style="{StaticResource SmallRound}" Content="+" Command="{Binding VolUpCommand}" Margin="0"/>
+                </StackPanel>
+              </Grid>
+
+              <TextBlock Text="{Binding Lyric}" Foreground="{DynamicResource AccentBrush}" FontSize="19" FontWeight="SemiBold" TextWrapping="Wrap" MinHeight="26" Margin="0,16,0,0"/>
+            </StackPanel>
+
+            <StackPanel Visibility="{Binding NoTrack, Converter={StaticResource B2V}}" VerticalAlignment="Center">
+              <TextBlock Text="Rien en lecture" FontFamily="{StaticResource LightFont}" FontWeight="SemiBold" FontSize="28"/>
+              <TextBlock Style="{StaticResource Dim}" Margin="0,6,0,0" FontSize="14"
+                         Text="Lance un morceau dans Cider, Apple Music ou iTunes, ou choisis un autre lecteur dans « Musique ». La carte affiche l'horloge en attendant."/>
+            </StackPanel>
+          </StackPanel>
+        </Grid>
+      </Grid>
+
+      <UniformGrid Rows="1">
+        <Border Style="{StaticResource Tile}" Margin="0,0,10,0" Padding="18,16">
+          <StackPanel>
+            <TextBlock Text="Carte" Style="{StaticResource TileTitle}" Margin="0,0,0,10"/>
+            <StackPanel Orientation="Horizontal">
+              <Ellipse Style="{StaticResource OnlineDot}" Margin="0,2,10,0"/>
+              <TextBlock Text="{Binding CardState}" FontSize="18" FontWeight="SemiBold" FontFamily="{StaticResource LightFont}"/>
+            </StackPanel>
+            <TextBlock Text="{Binding CardLine}" Style="{StaticResource Dim}" Margin="0,6,0,0"/>
+          </StackPanel>
+        </Border>
+        <Border Style="{StaticResource Tile}" Margin="0,0,10,0" Padding="18,16">
+          <StackPanel>
+            <TextBlock Text="Écran affiché" Style="{StaticResource TileTitle}" Margin="0,0,0,10"/>
+            <TextBlock Text="{Binding ScreenState}" FontSize="18" FontWeight="SemiBold" FontFamily="{StaticResource LightFont}"/>
+            <TextBlock Text="{Binding ScreenLine}" Style="{StaticResource Dim}" Margin="0,6,0,0"/>
+          </StackPanel>
+        </Border>
+        <Border Style="{StaticResource Tile}" Padding="18,16">
+          <StackPanel>
+            <TextBlock Text="Source" Style="{StaticResource TileTitle}" Margin="0,0,0,10"/>
+            <TextBlock Text="{Binding SourceState}" FontSize="18" FontWeight="SemiBold" FontFamily="{StaticResource LightFont}" TextTrimming="CharacterEllipsis"/>
+            <TextBlock Text="{Binding SourceLine}" Style="{StaticResource Dim}" Margin="0,6,0,0"/>
+          </StackPanel>
+        </Border>
+      </UniformGrid>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

@@ -1,0 +1,104 @@
+<UserControl x:Class="NowPlayingHub.StatusView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="clr-namespace:NowPlayingHub">
+  <ScrollViewer VerticalScrollBarVisibility="Auto">
+    <StackPanel Margin="36,24,36,36" MaxWidth="820" HorizontalAlignment="Left">
+      <TextBlock Text="Statut" Style="{StaticResource PageTitle}"/>
+      <Border Background="{Binding BannerBrush}" CornerRadius="8" Padding="24,20" Margin="0,0,0,10">
+        <TextBlock Text="{Binding BannerText}" FontSize="22" FontWeight="SemiBold" Foreground="White"/>
+      </Border>
+      <TextBlock Text="Disponibilité sur 30 jours · mesures toutes les 10 s tant que l'appli est ouverte (gris = pas de mesure, jamais compté comme une panne)." Style="{StaticResource Dim}" Margin="0,0,0,16"/>
+      <ItemsControl ItemsSource="{Binding Groups}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate>
+            <Border Style="{StaticResource Tile}">
+              <StackPanel>
+                <TextBlock Text="{Binding Name}" Style="{StaticResource TileTitle}"/>
+                <ItemsControl ItemsSource="{Binding Items}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <StackPanel Margin="0,0,0,20">
+                        <Grid>
+                          <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                          <TextBlock Text="{Binding Name}" FontSize="16" FontWeight="SemiBold"/>
+                          <TextBlock Grid.Column="1" Text="{Binding StateText}" Foreground="{Binding StateBrush}" FontSize="14"/>
+                        </Grid>
+                        <TextBlock Text="{Binding Note}" Style="{StaticResource Dim}" MinHeight="16" Margin="0,2,0,0"/>
+                        <ItemsControl ItemsSource="{Binding Days}" Margin="0,10,0,8">
+                        <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Rows="1"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate>
+                            <Border Height="30" Margin="1.5,0" Background="{Binding Brush}" ToolTip="{Binding Tip}"/>
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                        <Grid>
+                          <TextBlock Text="il y a 30 jours" Style="{StaticResource Dim}"/>
+                          <TextBlock Text="{Binding UptimeText}" Style="{StaticResource Dim}" HorizontalAlignment="Center"/>
+                          <TextBlock Text="aujourd'hui" Style="{StaticResource Dim}" HorizontalAlignment="Right"/>
+                        </Grid>
+                      </StackPanel>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </StackPanel>
+            </Border>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+      <TextBlock Text="carte esp32" FontFamily="{StaticResource LightFont}" FontSize="28" Margin="0,12,0,12"/>
+      <ItemsControl ItemsSource="{Binding Sections}">
+        <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+        <ItemsControl.ItemTemplate>
+          <DataTemplate>
+            <Border Style="{StaticResource Tile}" Width="338" Margin="0,0,12,12" Padding="18,16">
+              <StackPanel>
+                <TextBlock Text="{Binding Title}" Style="{StaticResource TileTitle}" Margin="0,0,0,10"/>
+                <ItemsControl ItemsSource="{Binding Rows}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <Grid Margin="0,0,0,5">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <TextBlock Text="{Binding Key}" Style="{StaticResource Dim}" Margin="0,0,10,0"/>
+                        <TextBlock Grid.Column="1" Text="{Binding Value}" Style="{StaticResource Mono}" TextAlignment="Right" TextWrapping="Wrap"/>
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </StackPanel>
+            </Border>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+      <ItemsControl ItemsSource="{Binding Sparks}">
+        <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+        <ItemsControl.ItemTemplate>
+          <DataTemplate>
+            <Border Style="{StaticResource Tile}" Width="161" Margin="0,0,12,12" Padding="16,14">
+              <StackPanel>
+                <TextBlock Text="{Binding Title}" Style="{StaticResource Dim}"/>
+                <TextBlock Text="{Binding Value}" FontFamily="{StaticResource LightFont}" FontSize="24" Margin="0,2,0,6"/>
+                <Polyline Points="{Binding Points}" Stroke="{DynamicResource AccentBrush}" StrokeThickness="1.5" Stretch="Fill" Height="34"/>
+              </StackPanel>
+            </Border>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+      <TextBlock Text="incidents récents" FontFamily="{StaticResource LightFont}" FontSize="28" Margin="0,12,0,12"/>
+      <ItemsControl ItemsSource="{Binding Incidents}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate>
+            <Border Style="{StaticResource Tile}" Margin="0,0,0,8" Padding="18,12" BorderBrush="{Binding Brush}" BorderThickness="4,0,0,0">
+              <StackPanel>
+                <TextBlock Text="{Binding Title}" FontSize="14"/>
+                <TextBlock Text="{Binding When}" Style="{StaticResource Dim}"/>
+                <TextBlock Text="{Binding Detail}" Style="{StaticResource Dim}" Margin="0,2,0,0"/>
+              </StackPanel>
+            </Border>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+      <StackPanel Orientation="Horizontal" Margin="0,8,0,0"><Button Content="Ouvrir la page web" Command="{Binding OpenWebCommand}" Margin="0,0,10,0"/><Button Content="Copier le statut (JSON)" Command="{Binding CopyJsonCommand}"/></StackPanel>
+      <TextBlock Text="{Binding WebText}" Style="{StaticResource Dim}" Margin="0,12,0,0"/>
+      <TextBlock Text="{Binding Message}" Style="{StaticResource Dim}" Margin="0,4,0,0"/>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

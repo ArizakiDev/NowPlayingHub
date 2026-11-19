@@ -1,30 +1,28 @@
 #pragma once
-// Reglages du projet (versionnes dans Git). Les secrets (Wi-Fi, jeton) sont dans config.h, qui n'est JAMAIS commite.
 
-// La version vit ici (et pas dans config.h) : on la monte avant chaque release.
 #ifdef FW_VERSION
 #undef FW_VERSION
 #endif
-#define FW_VERSION        "1.8.0"
+#define FW_VERSION        "1.10.0"
 
 #ifndef HOSTNAME
-#define HOSTNAME          "nowplaying"   // http://nowplaying.local
+#define HOSTNAME          "nowplaying"
 #endif
 #ifndef ROTATION
-#define ROTATION          1              // 1 = paysage ; 3 = paysage a l'envers
+#define ROTATION          1
 #endif
 #ifndef IDLE_TIMEOUT_MS
-#define IDLE_TIMEOUT_MS   15000          // sans nouvelles du PC -> ecran d'attente
+#define IDLE_TIMEOUT_MS   15000
 #endif
 #ifndef PAUSE_TO_IDLE_MS
-#define PAUSE_TO_IDLE_MS  30000          // apres X ms en pause -> ecran idle
+#define PAUSE_TO_IDLE_MS  30000
 #endif
 #ifndef COVER_MAX_BYTES
-#define COVER_MAX_BYTES   12288          // v1.8 : 16384 -> 12288 (le PC compresse a <= 11000 o)
+#define COVER_MAX_BYTES   12288
 #endif
 #ifndef ICON_MAX_BYTES
 #define ICON_MAX_BYTES    4096
 #endif
 #ifndef BIG_MAX_BYTES
-#define BIG_MAX_BYTES     20480          // pochette plein ecran 240x240 (envoyee a la demande)
+#define BIG_MAX_BYTES     20480
 #endif
